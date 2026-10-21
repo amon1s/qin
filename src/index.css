@@ -1,0 +1,181 @@
+@import "tailwindcss";
+
+@font-face {
+  font-family: 'Megrim';
+  src: url('/fonts/Megrim-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Smooch Sans';
+  src: url('/fonts/SmoochSans-Light.ttf') format('truetype');
+  font-weight: 300;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Smooch Sans';
+  src: url('/fonts/SmoochSans-Regular.ttf') format('truetype');
+  font-weight: 400;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Smooch Sans';
+  src: url('/fonts/SmoochSans-Medium.ttf') format('truetype');
+  font-weight: 500;
+  font-style: normal;
+  font-display: swap;
+}
+
+@font-face {
+  font-family: 'Smooch Sans';
+  src: url('/fonts/SmoochSans-Bold.ttf') format('truetype');
+  font-weight: 700;
+  font-style: normal;
+  font-display: swap;
+}
+
+:root {
+  --font-logo: 'Megrim', cursive, sans-serif;
+  --font-body: 'Smooch Sans', -apple-system, BlinkMacSystemFont, 'Segoe UI', Roboto, sans-serif;
+  --app-scale: 1;
+
+  /* Monochrome Theme Colors - Default Dark */
+  --bg-app: #09090b;
+  --text-main: #f4f4f5;
+  --text-muted: #a1a1aa;
+  --border-subtle: rgba(255, 255, 255, 0.1);
+  --panel-bg: rgba(18, 18, 22, 0.75);
+  --panel-border: rgba(255, 255, 255, 0.12);
+  --accent-surface: #27272a;
+  --accent-text: #ffffff;
+}
+
+/* Light Theme Variables */
+.light {
+  --bg-app: #f4f4f5;
+  --text-main: #09090b;
+  --text-muted: #52525b;
+  --border-subtle: rgba(0, 0, 0, 0.12);
+  --panel-bg: rgba(255, 255, 255, 0.85);
+  --panel-border: rgba(0, 0, 0, 0.12);
+  --accent-surface: #e4e4e7;
+  --accent-text: #09090b;
+}
+
+html, body {
+  font-family: var(--font-body);
+  letter-spacing: 0.025em;
+  font-weight: 400;
+  font-size: calc(18px * var(--app-scale));
+  background-color: var(--bg-app);
+  color: var(--text-main);
+  transition: background-color 0.25s ease, color 0.25s ease;
+}
+
+.font-megrim {
+  font-family: var(--font-logo) !important;
+}
+
+.font-smooch {
+  font-family: var(--font-body) !important;
+}
+
+/* Crisp Monochrome Minimalist Scrollbars */
+::-webkit-scrollbar {
+  width: 4px;
+  height: 4px;
+}
+::-webkit-scrollbar-track {
+  background: transparent;
+}
+::-webkit-scrollbar-thumb {
+  background: rgba(255, 255, 255, 0.2);
+  border-radius: 2px;
+}
+.light ::-webkit-scrollbar-thumb {
+  background: rgba(0, 0, 0, 0.2);
+}
+::-webkit-scrollbar-thumb:hover {
+  background: rgba(255, 255, 255, 0.4);
+}
+.light ::-webkit-scrollbar-thumb:hover {
+  background: rgba(0, 0, 0, 0.4);
+}
+
+/* Dashboard slide-fade transition */
+@keyframes slideFadeIn {
+  from {
+    opacity: 0;
+    transform: translateY(14px) scale(0.995);
+    filter: blur(3px);
+  }
+  to {
+    opacity: 1;
+    transform: translateY(0) scale(1);
+    filter: blur(0px);
+  }
+}
+
+.animate-slidefadein {
+  animation: slideFadeIn 0.45s cubic-bezier(0.16, 1, 0.3, 1) forwards;
+}
+
+@keyframes pulseGlowMonochrome {
+  0%, 100% {
+    opacity: 0.4;
+    text-shadow: 0 0 10px rgba(255, 255, 255, 0.2);
+  }
+  50% {
+    opacity: 0.95;
+    text-shadow: 0 0 18px rgba(255, 255, 255, 0.6);
+  }
+}
+
+.animate-pulse-glow {
+  animation: pulseGlowMonochrome 2.2s ease-in-out infinite;
+}
+
+/* Dynamic Glassmorphism Blur Engine */
+:root {
+  --glass-blur: 12px;
+}
+
+[data-blur="none"] {
+  --glass-blur: 0px !important;
+}
+[data-blur="sm"] {
+  --glass-blur: 4px !important;
+}
+[data-blur="md"] {
+  --glass-blur: 12px !important;
+}
+[data-blur="xl"] {
+  --glass-blur: 28px !important;
+}
+
+.glass-panel,
+.backdrop-blur-md,
+.backdrop-blur-sm,
+.backdrop-blur-lg,
+.backdrop-blur-xl,
+[class*="backdrop-blur"] {
+  backdrop-filter: blur(var(--glass-blur)) !important;
+  -webkit-backdrop-filter: blur(var(--glass-blur)) !important;
+}
+
+[data-blur="none"] .glass-panel,
+[data-blur="none"] [class*="backdrop-blur"] {
+  backdrop-filter: none !important;
+  -webkit-backdrop-filter: none !important;
+}
+
+.tabular-data {
+  font-variant-numeric: tabular-nums;
+  font-feature-settings: "tnum";
+}

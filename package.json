@@ -1,0 +1,45 @@
+{
+  "name": "qin",
+  "private": true,
+  "version": "1.0.0",
+  "main": "main.cjs",
+  "scripts": {
+    "dev": "vite",
+    "build": "vite build",
+    "app": "electron .",
+    "dist": "npm run build && electron-builder"
+  },
+  "dependencies": {
+    "@gsap/react": "^2.1.2",
+    "express": "^4.21.2",
+    "gsap": "^3.15.0",
+    "react": "^19.3.1",
+    "react-dom": "^19.3.1"
+  },
+  "devDependencies": {
+    "@tailwindcss/vite": "^4.3.3",
+    "@vitejs/plugin-react": "^6.1.2",
+    "electron": "^30.5.1",
+    "electron-builder": "^24.13.3",
+    "typescript": "^7.0.2",
+    "vite": "^8.3.0"
+  },
+  "build": {
+    "appId": "com.qin.desktop",
+    "productName": "Qin",
+    "directories": {
+      "output": "release"
+    },
+    "files": [
+      "dist/**/*",
+      "main.cjs",
+      "package.json"
+    ],
+    "linux": {
+  "target": ["AppImage"],
+  "icon": "/home/amon/qin/assets/icon.png",
+      "category": "Utility",
+      "description": "Secure, monochrome LLM API key manager"
+    }
+  }
+}
