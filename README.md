@@ -21,7 +21,6 @@ A minimal, standalone desktop application for Linux designed for managing and in
    ```bash
    chmod +x Qin-1.0.0.AppImage
 
-````
 
 3. Launch Qin:
 
