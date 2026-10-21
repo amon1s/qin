@@ -1,4 +1,4 @@
-````
+````markdown
 # Qin
 
 A minimal, standalone desktop application for Linux designed for managing and interacting with LLM API endpoints. Built with React, Vite, and Electron, Qin features a sleek monochromatic aesthetic, low resource overhead, and local proxy routing.
