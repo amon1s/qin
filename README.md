@@ -1,10 +1,11 @@
+````
 # Qin
 
 A minimal, standalone desktop application for Linux designed for managing and interacting with LLM API endpoints. Built with React, Vite, and Electron, Qin features a sleek monochromatic aesthetic, low resource overhead, and local proxy routing.
 
 ---
 
-## Features
+## ✨ Features
 
 * **Monochrome UI:** Clean, distraction-free interface built with React and Tailwind/GSAP.
 * **Embedded Express Proxy:** Direct local API proxy routing built right into the desktop bundle.
@@ -21,6 +22,7 @@ A minimal, standalone desktop application for Linux designed for managing and in
    ```bash
    chmod +x Qin-1.0.0.AppImage
 
+````
 
 3. Launch Qin:
 
@@ -56,7 +58,7 @@ If you want to clone and build Qin from source:
 1. **Clone the repository:**
 
 ```bash
-git clone https://github.com/amon1s/qin.git
+git clone [https://github.com/amon1s/qin.git](https://github.com/amon1s/qin.git)
 cd qin
 
 ```
@@ -103,5 +105,7 @@ qin/
 ## 📄 License
 
 MIT © [amon1s](https://www.google.com/search?q=https://github.com/amon1s)
+
+```
 
 ```
