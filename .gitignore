@@ -1,9 +1,29 @@
 node_modules/
 build/
 dist/
+release/
 coverage/
 .DS_Store
+Thumbs.db
 *.log
-.env*
+npm-debug.log*
+.env
+.env.*
 !.env.example
-release/
+
+# Vite / build caches
+.vite/
+node_modules/.vite/
+node_modules/.vite-temp/
+*.tsbuildinfo
+
+# Packaged artifacts
+*.AppImage
+*.deb
+*.rpm
+*.snap
+*.tar.gz
+*.zip
+
+# Downloaded font archives (regenerated from public/fonts)
+public/assets/fontsnstuff/

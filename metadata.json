@@ -1,7 +1,0 @@
-{
-  "name": "Qin",
-  "description": "Your Universal LLM API manager and handler.",
-  "requestFramePermissions": [],
-  "majorCapabilities": ["MAJOR_CAPABILITY_SERVER_SIDE_GEMINI_API"]
-}
-

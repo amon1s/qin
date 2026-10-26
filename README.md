@@ -1,111 +1,169 @@
-````
 # Qin
 
-A minimal, standalone desktop application for Linux designed for managing and interacting with LLM API endpoints. Built with React, Vite, and Electron, Qin features a sleek monochromatic aesthetic, low resource overhead, and local proxy routing.
+A local desktop app for managing LLM API endpoints: store keys in an encrypted
+vault, discover the models each endpoint offers, send test completions through a
+loopback proxy, and see what each request cost.
+
+Built with React, Vite and Electron. Linux-first, packaged as a single AppImage.
 
 ---
 
-## ✨ Features
+## What it does
 
-* **Monochrome UI:** Clean, distraction-free interface built with React and Tailwind/GSAP.
-* **Embedded Express Proxy:** Direct local API proxy routing built right into the desktop bundle.
-* **Standalone Portability:** Packaged as a single, zero-dependency `.AppImage` binary.
-* **Native Integration:** Includes custom desktop launcher support (`qin.desktop`) and high-resolution icons.
-* **Local Storage:** Config and API keys persist securely on your local system (`~/.config/Qin/`).
+- **Encrypted key vault** — AES-GCM 256 with PBKDF2-SHA256 at 600,000 iterations.
+  A random data key encrypts the vault and is wrapped twice: once with your
+  master password, once with a recovery key. Either one unlocks it.
+- **Multi-instance endpoints** — the same company can hold several accounts or
+  regions, each with its own key, base URL and auth style.
+- **OpenAI-compatible and custom endpoints** — preset providers (OpenAI,
+  Anthropic, Groq, DeepSeek, Mistral, OpenRouter, Ollama) or any base URL with a
+  custom auth header.
+- **Model discovery** — reads `/v1/models`, Ollama's `/api/tags`, or any path you
+  specify. Context windows and prices are shown only when the provider actually
+  publishes them.
+- **Test dispatcher** — send a real completion, inspect tokens, latency and the
+  raw JSON. Requests can be cancelled, and every call has a deadline.
+- **Token ledger** — records tokens, latency and cost per request, and marks each
+  cost as *published* by the provider, an *estimate*, or *local* (free).
+- **Local proxy** — the renderer never calls a provider directly. One proxy, one
+  timeout policy, one place that holds the session token.
 
 ---
 
-## 🚀 Quick Start (AppImage)
+## Security model
 
-1. Head over to the **[Releases](../../releases)** page and download `Qin-1.0.0.AppImage`.
-2. Make the file executable:
-   ```bash
-   chmod +x Qin-1.0.0.AppImage
+Worth knowing exactly what is and is not protected.
 
-````
+| Concern | Behaviour |
+| --- | --- |
+| Where keys live | `~/.config/qin/vault.json`, encrypted, written `0600`. |
+| Master password | Never stored and never hashed. It is proven by decrypting the vault. |
+| Recovery key | Unwraps the same data key, so resetting the password keeps your keys. |
+| Renderer sandbox | `contextIsolation: true`, `nodeIntegration: false`, `sandbox: true`. |
+| Proxy binding | `127.0.0.1` only, on an OS-assigned port. |
+| Proxy auth | Requires a per-launch 32-byte token, handed over via the preload bridge. |
+| SSRF guard | Cloud metadata (`169.254.0.0/16`), `.internal` hosts and non-HTTP schemes rejected. |
+| CSP | `default-src 'self'`, `script-src 'self'`, `frame-ancestors 'none'`. |
 
-3. Launch Qin:
+What it does **not** protect against: a compromised local account, malware with
+access to your user session, or a provider that logs your prompts. The vault
+protects keys at rest — not a machine that is already compromised.
+
+---
+
+## Install (AppImage)
+
+1. Download `Qin-<version>.AppImage` from [Releases](../../releases).
+2. `chmod +x Qin-*.AppImage`
+3. `./Qin-*.AppImage`
+
+If your distro does not run AppImages out of the box, install FUSE:
 
 ```bash
-./Qin-1.0.0.AppImage
-
+# Ubuntu / Debian
+sudo apt install libfuse2
+# Fedora
+sudo dnf install fuse-libs
 ```
 
-> **Note for Ubuntu / Debian / Fedora Users:** If your distribution does not support AppImages out of the box, ensure `libfuse2` is installed:
->
-> ```bash
-> # Ubuntu/Debian
-> sudo apt install libfuse2
->
-> # Fedora
-> sudo dnf install fuse-libs
->
-> ```
-
 ---
 
-## 🛠️ Development Setup
+## Build from source
 
-If you want to clone and build Qin from source:
-
-### Prerequisites
-
-- **Node.js** (v18 or higher)
-- **npm** or **pnpm**
-
-### Installation
-
-1. **Clone the repository:**
+Requires **Node.js 20+** and npm.
 
 ```bash
-git clone [https://github.com/amon1s/qin.git](https://github.com/amon1s/qin.git)
+git clone https://github.com/amon1s/qin.git
 cd qin
-
-```
-
-2. **Install dependencies:**
-
-```bash
 npm install
 
+npm run dev      # Vite dev server on 127.0.0.1:5173 (browser mode, localStorage)
+npm run app      # Electron against the built dist/
+npm run verify   # typecheck + unit tests + build + proxy smoke test
+npm run dist     # verify, then produce release/Qin-<version>.AppImage
 ```
 
-3. **Run in development mode:**
+`npm run dist` will not package unless `typecheck`, the unit tests, the build and
+the proxy smoke test all pass.
 
-```bash
-npm run dev
+### Scripts
 
-```
-
-4. **Build the production AppImage:**
-
-```bash
-npm run dist
-
-```
-
-The compiled `.AppImage` binary will be generated in the `release/` directory.
+| Script | What it does |
+| --- | --- |
+| `npm run dev` | Vite dev server with a dev copy of the proxy |
+| `npm run build` | Production renderer build into `dist/` |
+| `npm run app` | Launch Electron against `dist/` |
+| `npm run typecheck` | `tsc --noEmit` |
+| `npm run test` | Vitest unit tests (services layer) |
+| `npm run smoke` | Boots the real proxy; asserts token, SSRF, streaming, timeout, CSP |
+| `npm run check:renderer` | Against a running app with `--remote-debugging-port`: renderer mounts, bridge present, no Node access |
+| `npm run check:storage` | Against a running app: writes land on disk `0600`, key allowlist enforced |
+| `npm run verify` | All of the above |
+| `npm run dist` | `verify` + electron-builder AppImage |
 
 ---
 
-## 📂 Project Structure
+## Where your data lives
 
-```text
+Everything is under the Electron userData directory:
+
+```
+~/.config/qin/
+├── vault.json        # encrypted payload (wrapped data key + encrypted body)
+├── vault_meta.json   # KDF version, timestamps, recovery state
+├── ledger.json       # request history (prompt snippets included)
+└── settings.json     # appearance and behaviour
+```
+
+`vault.json` is ciphertext — copying it without the password or recovery key gets
+you nothing. `ledger.json` is plaintext and contains prompt snippets; clear it
+from the app if that matters to you.
+
+Upgrading from a pre-1.1 build migrates the old `localStorage` vault into
+`vault.json` on first launch and re-encrypts it at the current KDF strength.
+
+---
+
+## Project structure
+
+```
 qin/
-├── assets/          # Application branding & window icons
-├── public/          # Static web assets & fonts
-├── src/             # React application, UI components, & styles
-├── main.cjs         # Electron main process & local server launcher
-└── package.json     # Electron-builder configuration & scripts
-
+├── main.cjs           # Electron main: storage IPC, window, boot
+├── proxy.cjs          # Local proxy + static host (testable without Electron)
+├── preload.cjs        # contextBridge surface exposed as window.qin
+├── scripts/
+│   └── smoke-proxy.mjs
+├── src/
+│   ├── App.tsx        # app shell, vault lifecycle, provider state
+│   ├── components/    # vault, discovery, ledger, dispatcher, settings
+│   ├── services/
+│   │   ├── crypto.ts    # vault format, KDF, recovery wrapping
+│   │   ├── proxy.ts     # renderer-side proxy client (timeouts, error mapping)
+│   │   ├── providers.ts # presets, URL building, discovery, dispatch
+│   │   ├── ledger.ts    # pricing resolution and ledger accounting
+│   │   └── storage.ts   # file-backed store (localStorage in browser dev)
+│   └── types/
+├── assets/            # app icon
+└── public/fonts/      # Megrim + Smooch Sans
 ```
 
 ---
 
-## 📄 License
+## Notes and limitations
 
-MIT © [amon1s](https://www.google.com/search?q=https://github.com/amon1s)
+- **GSAP Club plugins.** The splash intro uses GSAP's `SplitText`. If it is not
+  licensed for your use, the component falls back to plain text and logs a
+  warning — nothing else breaks.
+- **Streaming.** The proxy streams responses, so `stream: true` works through it,
+  but the dispatcher UI currently renders only the completed response.
+- **Costs are only as good as the provider's data.** OpenRouter publishes per-model
+  pricing, so its costs are exact. Where a provider publishes none, the row is
+  labelled `estimate` rather than presented as measured.
+- **Single window.** A second launch focuses the existing window instead of
+  starting a competing server.
 
-```
+---
 
-```
+## License
+
+MIT © [Amon (amon1s)](https://github.com/amon1s)

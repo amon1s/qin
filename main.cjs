@@ -1,58 +1,109 @@
-const { app, BrowserWindow } = require('electron');
+/**
+ * Qin — Electron main process.
+ *
+ * Owns three things:
+ *   1. Persistence of the encrypted vault / ledger / settings as JSON files in
+ *      the app's userData directory (~/.config/qin on Linux).
+ *   2. A loopback-only proxy the renderer talks to same-origin, so no CORS
+ *      workaround and no `webSecurity: false` are needed.
+ *   3. The window, with a locked-down sandbox posture.
+ */
+
+const { app, BrowserWindow, ipcMain, shell } = require('electron');
 const path = require('path');
-const express = require('express');
+const fsp = require('fs/promises');
+const crypto = require('crypto');
+const { createProxyApp } = require('./proxy.cjs');
+
+const PROXY_HOST = '127.0.0.1';
+// Per-launch secret. The renderer gets it through the preload bridge; anything
+// else on the machine (or the LAN) gets 401.
+const PROXY_TOKEN = crypto.randomBytes(32).toString('hex');
+const DEV_SERVER_URL = process.env.QIN_DEV_SERVER_URL || '';
+
+// Only these keys may be read or written through the storage bridge, so a
+// compromised renderer cannot scribble arbitrary files into userData.
+const STORAGE_KEYS = new Set(['vault', 'vault_meta', 'ledger', 'settings']);
 
 let server = null;
-const PORT = 3000;
+let proxyPort = 0;
+let mainWindow = null;
 
-function startServer() {
-  const expressApp = express();
-  expressApp.use(express.json({ limit: '10mb' }));
+/* ------------------------------------------------------------------ storage */
 
-  // Serve static React build files from dist directory
-  expressApp.use(express.static(path.join(__dirname, 'dist')));
-
-  // Embedded API proxy route (eliminates CORS / network errors)
-  expressApp.all('/api/proxy', async (req, res) => {
-    res.setHeader('Access-Control-Allow-Origin', '*');
-    res.setHeader('Access-Control-Allow-Methods', 'GET, POST, OPTIONS');
-    res.setHeader('Access-Control-Allow-Headers', 'Content-Type, Authorization, x-api-key, anthropic-version, x-target-url');
-
-    if (req.method === 'OPTIONS') return res.status(200).end();
-
-    try {
-      const targetUrl = req.headers['x-target-url'];
-      if (!targetUrl) return res.status(400).json({ error: 'Missing target URL' });
-
-      const response = await fetch(targetUrl, {
-        method: req.method,
-        headers: {
-          'Content-Type': req.headers['content-type'] || 'application/json',
-          ...(req.headers['authorization'] && { 'Authorization': req.headers['authorization'] }),
-          ...(req.headers['x-api-key'] && { 'x-api-key': req.headers['x-api-key'] }),
-          ...(req.headers['anthropic-version'] && { 'anthropic-version': req.headers['anthropic-version'] }),
-        },
-        body: ['GET', 'HEAD'].includes(req.method) ? undefined : JSON.stringify(req.body),
-      });
-
-      res.status(response.status);
-      response.headers.forEach((val, key) => {
-        if (!['content-encoding', 'content-length'].includes(key.toLowerCase())) {
-          res.setHeader(key, val);
-        }
-      });
-      res.send(await response.text());
-    } catch (err) {
-      res.status(502).json({ error: 'Proxy failed', details: err?.message });
-    }
-  });
-
-  server = expressApp.listen(PORT);
+function storageDir() {
+  return app.getPath('userData');
 }
 
+function fileFor(key) {
+  if (!STORAGE_KEYS.has(key)) throw new Error(`Unknown storage key: ${key}`);
+  return path.join(storageDir(), `${key}.json`);
+}
+
+async function readStore(key) {
+  try {
+    return JSON.parse(await fsp.readFile(fileFor(key), 'utf8'));
+  } catch (err) {
+    if (err.code === 'ENOENT') return null;
+    throw err;
+  }
+}
+
+async function writeStore(key, value) {
+  const target = fileFor(key);
+  const tmp = `${target}.${process.pid}.tmp`;
+  await fsp.mkdir(path.dirname(target), { recursive: true });
+  // 0600: the vault holds an encrypted payload, the ledger holds prompt
+  // snippets. Neither should be world-readable.
+  await fsp.writeFile(tmp, JSON.stringify(value, null, 2), { mode: 0o600 });
+  await fsp.rename(tmp, target);
+}
+
+async function removeStore(key) {
+  try {
+    await fsp.unlink(fileFor(key));
+  } catch (err) {
+    if (err.code !== 'ENOENT') throw err;
+  }
+}
+
+function registerStorageHandlers() {
+  ipcMain.on('qin:config', event => {
+    event.returnValue = {
+      proxyPort,
+      proxyToken: PROXY_TOKEN,
+      userDataPath: storageDir(),
+      version: app.getVersion(),
+    };
+  });
+
+  ipcMain.handle('qin:storage:get', (_event, key) => readStore(key));
+  ipcMain.handle('qin:storage:set', async (_event, key, value) => {
+    await writeStore(key, value);
+    return true;
+  });
+  ipcMain.handle('qin:storage:remove', async (_event, key) => {
+    await removeStore(key);
+    return true;
+  });
+  ipcMain.handle('qin:storage:keys', async () => {
+    const entries = await Promise.all(
+      [...STORAGE_KEYS].map(async key => ((await readStore(key)) === null ? null : key))
+    );
+    return entries.filter(Boolean);
+  });
+
+  ipcMain.handle('qin:open-external', async (_event, url) => {
+    if (typeof url !== 'string' || !/^https?:\/\//i.test(url)) return false;
+    await shell.openExternal(url);
+    return true;
+  });
+}
+
+/* ------------------------------------------------------------------- window */
+
 function createWindow() {
-  startServer();
-  const mainWindow = new BrowserWindow({
+  mainWindow = new BrowserWindow({
     width: 1280,
     height: 800,
     minWidth: 900,
@@ -60,24 +111,99 @@ function createWindow() {
     title: 'Qin',
     backgroundColor: '#0a0a0a',
     autoHideMenuBar: true,
+    show: false,
     webPreferences: {
-      nodeIntegration: true,
-      contextIsolation: false,
-      webSecurity: false
-    }
+      preload: path.join(__dirname, 'preload.cjs'),
+      // The renderer holds decrypted API keys in memory. Any injected markup
+      // must not be able to reach Node.
+      nodeIntegration: false,
+      contextIsolation: true,
+      sandbox: true,
+      webSecurity: true,
+      spellcheck: false,
+    },
   });
 
-  // Wait briefly for express to bind port 3000, then load
-  setTimeout(() => mainWindow.loadURL(`http://localhost:${PORT}`), 400);
+  mainWindow.once('ready-to-show', () => mainWindow.show());
+
+  const targetUrl = DEV_SERVER_URL || `http://${PROXY_HOST}:${proxyPort}`;
+  mainWindow.loadURL(targetUrl);
+
+  // No in-app navigation away from our own origin, and no popup windows.
+  mainWindow.webContents.on('will-navigate', (event, url) => {
+    if (!url.startsWith(targetUrl)) {
+      event.preventDefault();
+      if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    }
+  });
+  mainWindow.webContents.setWindowOpenHandler(({ url }) => {
+    if (/^https?:\/\//i.test(url)) shell.openExternal(url);
+    return { action: 'deny' };
+  });
 
   mainWindow.on('closed', () => {
-    if (server) server.close();
+    mainWindow = null;
   });
 }
 
-app.whenReady().then(createWindow);
+/* --------------------------------------------------------------------- boot */
+
+function startServer() {
+  return new Promise((resolve, reject) => {
+    const proxyApp = createProxyApp({
+      proxyToken: PROXY_TOKEN,
+      distDir: path.join(__dirname, 'dist'),
+      version: app.getVersion(),
+    });
+
+    // Port 0 lets the OS pick a free port, which removes the whole class of
+    // EADDRINUSE failures when a second copy (or something else on 3000) runs.
+    server = proxyApp.listen(0, PROXY_HOST, () => {
+      proxyPort = server.address().port;
+      resolve(proxyPort);
+    });
+
+    server.on('error', reject);
+  });
+}
+
+// A second launch should focus the existing window instead of failing to bind
+// a port and looking broken.
+if (!app.requestSingleInstanceLock()) {
+  app.quit();
+} else {
+  app.on('second-instance', () => {
+    if (mainWindow) {
+      if (mainWindow.isMinimized()) mainWindow.restore();
+      mainWindow.focus();
+    }
+  });
+
+  app.whenReady().then(async () => {
+    registerStorageHandlers();
+    try {
+      await startServer();
+    } catch (err) {
+      console.error('[qin] proxy failed to start:', err);
+    }
+    createWindow();
+
+    app.on('activate', () => {
+      if (BrowserWindow.getAllWindows().length === 0) createWindow();
+    });
+  });
+}
+
+function shutdown() {
+  if (server) {
+    server.close();
+    server = null;
+  }
+}
 
 app.on('window-all-closed', () => {
-  if (server) server.close();
+  shutdown();
   if (process.platform !== 'darwin') app.quit();
 });
+
+app.on('before-quit', shutdown);

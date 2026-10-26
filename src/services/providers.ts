@@ -1,4 +1,15 @@
-import { ProviderConfig, ProviderId, LLMModel, ProviderStatus, AuthType } from '../types';
+/**
+ * Provider presets, model discovery, and completion dispatch.
+ *
+ * All network traffic goes through the local proxy (see ./proxy.ts) so there is
+ * exactly one place that enforces deadlines and one place that holds the
+ * session token. There is deliberately no direct-fetch fallback: the previous
+ * build fell back to calling the provider straight from the renderer, which
+ * leaked keys into a CORS-blocked request and made failures hard to attribute.
+ */
+
+import { LLMModel, ProviderConfig, ProviderStatus, AuthType } from '../types';
+import { proxyRequest, ProxyError, DEFAULT_TIMEOUT_MS, COMPLETION_TIMEOUT_MS } from './proxy';
 
 export interface ProviderPreset {
   id: string;
@@ -77,471 +88,654 @@ export const PROVIDER_PRESETS: ProviderPreset[] = [
   },
 ];
 
-export const CANONICAL_PROVIDERS: Omit<ProviderConfig, 'apiKey' | 'status' | 'models' | 'balanceInfo'>[] = [
-  {
-    id: 'openai_primary',
-    name: 'OpenAI Primary',
-    companyName: 'OpenAI',
-    instanceName: 'Primary',
-    presetKey: 'openai',
-    baseUrl: 'https://api.openai.com/v1',
-    modelsEndpoint: '/models',
-    authType: 'bearer',
-  },
-  {
-    id: 'anthropic_primary',
-    name: 'Anthropic Primary',
-    companyName: 'Anthropic',
-    instanceName: 'Primary',
-    presetKey: 'anthropic',
-    baseUrl: 'https://api.anthropic.com/v1',
-    modelsEndpoint: '/models',
-    authType: 'x-api-key',
-  },
-  {
-    id: 'groq_primary',
-    name: 'Groq Primary',
-    companyName: 'Groq',
-    instanceName: 'Primary',
-    presetKey: 'groq',
-    baseUrl: 'https://api.groq.com/openai/v1',
-    modelsEndpoint: '/models',
-    authType: 'bearer',
-  },
-  {
-    id: 'deepseek_primary',
-    name: 'DeepSeek Primary',
-    companyName: 'DeepSeek',
-    instanceName: 'Primary',
-    presetKey: 'deepseek',
-    baseUrl: 'https://api.deepseek.com/v1',
-    modelsEndpoint: '/models',
-    authType: 'bearer',
-  },
-  {
-    id: 'mistral_primary',
-    name: 'Mistral AI Primary',
-    companyName: 'Mistral AI',
-    instanceName: 'Primary',
-    presetKey: 'mistral',
-    baseUrl: 'https://api.mistral.ai/v1',
-    modelsEndpoint: '/models',
-    authType: 'bearer',
-  },
-  {
-    id: 'openrouter_primary',
-    name: 'OpenRouter Primary',
-    companyName: 'OpenRouter',
-    instanceName: 'Primary',
-    presetKey: 'openrouter',
-    baseUrl: 'https://openrouter.ai/api/v1',
-    modelsEndpoint: '/models',
-    authType: 'bearer',
-  },
-  {
-    id: 'ollama_primary',
-    name: 'Ollama (Local) Primary',
-    companyName: 'Ollama (Local)',
-    instanceName: 'Primary',
-    presetKey: 'ollama',
-    baseUrl: 'http://localhost:11434',
-    modelsEndpoint: '/api/tags',
-    authType: 'none',
-  },
-];
+type ProviderSeed = Omit<ProviderConfig, 'apiKey' | 'status' | 'models' | 'balanceInfo'>;
 
 /**
- * Universal dynamic model discovery across standard, custom, and multi-instance endpoints
+ * Derived from the presets rather than hand-listed, so a preset and its
+ * default instance can never drift apart.
  */
-export async function validateAndDiscover(
-  provider: ProviderConfig
-): Promise<{
+export const CANONICAL_PROVIDERS: ProviderSeed[] = PROVIDER_PRESETS.map(preset => ({
+  id: `${preset.id}_primary`,
+  name: `${preset.companyName} Primary`,
+  companyName: preset.companyName,
+  instanceName: 'Primary',
+  presetKey: preset.id,
+  baseUrl: preset.defaultBaseUrl,
+  modelsEndpoint: preset.defaultModelsEndpoint,
+  authType: preset.authType,
+  customHeaderName: preset.customHeaderName,
+}));
+
+/* --------------------------------------------------------------- URL building */
+
+const VERSION_SEGMENT = /\/v\d+(\/|$)/i;
+
+function stripTrailingSlashes(url: string): string {
+  return url.replace(/\/+$/, '');
+}
+
+function ensureLeadingSlash(path: string): string {
+  return path.startsWith('/') ? path : `/${path}`;
+}
+
+/**
+ * Join a base URL with a path, collapsing the seam.
+ *
+ * The old implementation appended `/v1` whenever the base did not already end
+ * in `/v1`, which turned `https://api.nous.ai/v1` + `/models` into
+ * `https://api.nous.ai/v1/v1/models` — a guaranteed 404 on every
+ * OpenAI-compatible custom endpoint.
+ */
+export function joinUrl(baseUrl: string, path: string): string {
+  const base = stripTrailingSlashes(baseUrl.trim());
+  const suffix = ensureLeadingSlash(path.trim());
+  return `${base}${suffix}`;
+}
+
+export function buildModelsUrl(
+  provider: Pick<ProviderConfig, 'baseUrl' | 'modelsEndpoint' | 'presetKey'>
+): string {
+  const base = stripTrailingSlashes(provider.baseUrl.trim());
+
+  if (provider.presetKey === 'ollama') return joinUrl(base, '/api/tags');
+
+  const endpoint = ensureLeadingSlash((provider.modelsEndpoint || '/models').trim());
+
+  // An explicit versioned path is authoritative.
+  if (VERSION_SEGMENT.test(endpoint)) return joinUrl(base, endpoint);
+
+  // The base already carries a version segment; don't add a second one.
+  if (VERSION_SEGMENT.test(base)) return joinUrl(base, endpoint);
+
+  return joinUrl(base, `/v1${endpoint}`);
+}
+
+export function buildChatUrl(
+  provider: Pick<ProviderConfig, 'baseUrl' | 'presetKey' | 'chatEndpoint'>
+): string {
+  const base = stripTrailingSlashes(provider.baseUrl.trim());
+
+  if (provider.chatEndpoint) return joinUrl(base, provider.chatEndpoint);
+  if (provider.presetKey === 'ollama') return joinUrl(base, '/api/generate');
+  if (provider.presetKey === 'anthropic') return joinUrl(base, '/messages');
+
+  if (/\/chat\/completions$/i.test(base)) return base;
+  if (VERSION_SEGMENT.test(base)) return joinUrl(base, '/chat/completions');
+  return joinUrl(base, '/v1/chat/completions');
+}
+
+export function buildBalanceUrl(
+  provider: Pick<ProviderConfig, 'baseUrl' | 'presetKey'>
+): string | null {
+  if (provider.presetKey !== 'openrouter') return null;
+  return joinUrl(provider.baseUrl, '/auth/key');
+}
+
+export function buildAuthHeaders(
+  provider: Pick<ProviderConfig, 'authType' | 'apiKey' | 'customHeaderName'> &
+    Partial<Pick<ProviderConfig, 'presetKey'>>
+): Record<string, string> {
+  const headers: Record<string, string> = { 'Content-Type': 'application/json' };
+
+  if (provider.authType === 'bearer' && provider.apiKey) {
+    headers['Authorization'] = `Bearer ${provider.apiKey}`;
+  } else if (provider.authType === 'x-api-key' && provider.apiKey) {
+    headers['x-api-key'] = provider.apiKey;
+  } else if (provider.authType === 'custom' && provider.customHeaderName && provider.apiKey) {
+    headers[provider.customHeaderName] = provider.apiKey;
+  }
+
+  return headers;
+}
+
+/** Anthropic requires its version header, whatever the auth style. */
+function withAnthropicVersion(
+  headers: Record<string, string>,
+  provider: Pick<ProviderConfig, 'presetKey' | 'baseUrl'>
+): Record<string, string> {
+  const isAnthropic =
+    provider.presetKey === 'anthropic' || /anthropic\.com/i.test(provider.baseUrl);
+  if (isAnthropic && !headers['anthropic-version']) {
+    return { ...headers, 'anthropic-version': '2023-06-01' };
+  }
+  return headers;
+}
+
+export function isLocalProvider(
+  provider: Pick<ProviderConfig, 'presetKey' | 'authType'>
+): boolean {
+  return provider.presetKey === 'ollama' || provider.authType === 'none';
+}
+
+/* ------------------------------------------------------------- model parsing */
+
+/**
+ * Parse a human parameter count such as `"7B"`, `"1.5b"`, `"350M"` into an
+ * absolute count. `parseInt("7B")` is `7`, which the old build stored as a
+ * context window of seven tokens.
+ */
+export function parseParameterCount(raw?: string | null): number | undefined {
+  if (!raw) return undefined;
+  const match = /^\s*([\d.]+)\s*([kmbt])?/i.exec(String(raw));
+  if (!match) return undefined;
+  const value = Number.parseFloat(match[1]);
+  if (!Number.isFinite(value) || value <= 0) return undefined;
+  const unit = (match[2] || '').toLowerCase();
+  const multiplier =
+    unit === 'k' ? 1e3 : unit === 'm' ? 1e6 : unit === 'b' ? 1e9 : unit === 't' ? 1e12 : 1;
+  return Math.round(value * multiplier);
+}
+
+/** OpenRouter-style per-token price string → USD per 1M tokens. */
+export function perTokenToPerMillion(raw: unknown): number | undefined {
+  if (raw === undefined || raw === null || raw === '') return undefined;
+  const value = Number.parseFloat(String(raw));
+  if (!Number.isFinite(value) || value < 0) return undefined;
+  return Math.round(value * 1_000_000 * 1e6) / 1e6;
+}
+
+function inferCategory(id: string): LLMModel['category'] {
+  const lower = id.toLowerCase();
+  if (/(reason|r1|o1|o3|o4|think|qwq)/.test(lower)) return 'reasoning';
+  if (/(code|coder|codestral|devstral)/.test(lower)) return 'coding';
+  if (/(vision|vl|llava|multimodal)/.test(lower)) return 'vision';
+  if (/(flash|mini|haiku|nano|tiny|\d+b)/.test(lower)) return 'fast';
+  return 'general';
+}
+
+function toModel(
+  provider: ProviderConfig,
+  raw: Record<string, unknown>,
+  overrides: Partial<LLMModel> = {}
+): LLMModel | null {
+  const id = (raw.id ?? raw.name ?? raw.model) as string | undefined;
+  if (!id || typeof id !== 'string') return null;
+
+  return {
+    id,
+    name: ((raw.display_name ?? raw.name ?? id) as string) || id,
+    providerId: provider.id,
+    category: inferCategory(id),
+    supportsStreaming: true,
+    description: (raw.description as string | undefined) ?? undefined,
+    lastDiscoveredAt: new Date().toISOString(),
+    ...overrides,
+  };
+}
+
+export function parseModelsPayload(provider: ProviderConfig, payload: unknown): LLMModel[] {
+  const models: LLMModel[] = [];
+  if (!payload) return models;
+
+  const record = payload as Record<string, unknown>;
+  const list: unknown[] = Array.isArray(payload)
+    ? payload
+    : Array.isArray(record.data)
+      ? (record.data as unknown[])
+      : Array.isArray(record.models)
+        ? (record.models as unknown[])
+        : [];
+
+  const isOllama = provider.presetKey === 'ollama';
+
+  for (const entry of list) {
+    if (typeof entry === 'string') {
+      models.push({
+        id: entry,
+        name: entry,
+        providerId: provider.id,
+        category: inferCategory(entry),
+        supportsStreaming: true,
+        lastDiscoveredAt: new Date().toISOString(),
+      });
+      continue;
+    }
+    if (!entry || typeof entry !== 'object') continue;
+
+    const raw = entry as Record<string, unknown>;
+    const details = (raw.details ?? {}) as Record<string, unknown>;
+    const overrides: Partial<LLMModel> = {};
+
+    // Context window only from a real field — never fabricated. The UI shows
+    // "Unknown ctx" rather than a wrong number.
+    const contextWindow =
+      raw.context_length ?? raw.context_window ?? details.context_length ?? raw.max_context_length;
+    if (typeof contextWindow === 'number' && contextWindow > 0) {
+      overrides.contextWindow = contextWindow;
+    }
+
+    if (isOllama) {
+      const parameterCount = parseParameterCount(
+        (details.parameter_size ?? raw.parameter_size) as string | undefined
+      );
+      if (parameterCount) overrides.parameterCount = parameterCount;
+    }
+
+    // Pricing only when the provider actually publishes it.
+    if (raw.pricing && typeof raw.pricing === 'object') {
+      const pricing = raw.pricing as Record<string, unknown>;
+      const input = perTokenToPerMillion(pricing.prompt ?? pricing.input);
+      const output = perTokenToPerMillion(pricing.completion ?? pricing.output);
+      if (input !== undefined) overrides.inputCostPer1m = input;
+      if (output !== undefined) overrides.outputCostPer1m = output;
+    }
+
+    const model = toModel(provider, raw, overrides);
+    if (model) models.push(model);
+  }
+
+  const seen = new Set<string>();
+  return models.filter(model => {
+    if (seen.has(model.id)) return false;
+    seen.add(model.id);
+    return true;
+  });
+}
+
+/* ---------------------------------------------------------------- discovery */
+
+export interface DiscoveryResult {
   status: ProviderStatus;
   statusMessage: string;
   latencyMs: number;
   models: LLMModel[];
   balanceInfo?: ProviderConfig['balanceInfo'];
-}> {
-  const startTime = performance.now();
+}
 
-  // If unconfigured (no key and not local ollama)
-  if (!provider.apiKey && provider.authType !== 'none') {
-    return {
-      status: 'unconfigured',
-      statusMessage: 'Unconfigured (No API key)',
-      latencyMs: 0,
-      models: [],
-      balanceInfo: null,
-    };
-  }
+function failure(status: ProviderStatus, statusMessage: string, latencyMs: number): DiscoveryResult {
+  return { status, statusMessage, latencyMs, models: [], balanceInfo: null };
+}
 
-  // Construct target URL
-  let targetUrl = provider.baseUrl.replace(/\/+$/, '');
-  const endpoint = provider.modelsEndpoint.startsWith('/') ? provider.modelsEndpoint : '/' + provider.modelsEndpoint;
-
-  if (provider.presetKey === 'openrouter') {
-    targetUrl = 'https://openrouter.ai/api/v1/models';
-  } else if (provider.presetKey === 'ollama') {
-    targetUrl = `${targetUrl}/api/tags`;
-  } else if (!targetUrl.endsWith('/v1') && !targetUrl.endsWith('/models') && endpoint === '/models') {
-    targetUrl = `${targetUrl}${endpoint.startsWith('/v1') ? endpoint : '/v1' + endpoint}`;
-  } else {
-    targetUrl = `${targetUrl}${endpoint}`;
-  }
-
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
-
-  if (provider.authType === 'bearer') {
-    headers['Authorization'] = `Bearer ${provider.apiKey}`;
-  } else if (provider.authType === 'x-api-key') {
-    headers['x-api-key'] = provider.apiKey;
-    headers['anthropic-version'] = '2023-06-01';
-  } else if (provider.authType === 'custom' && provider.customHeaderName) {
-    headers[provider.customHeaderName] = provider.apiKey;
-  }
-
-  let response: Response | null = null;
-  let fetchError: any = null;
+async function fetchOpenRouterBalance(
+  provider: ProviderConfig
+): Promise<ProviderConfig['balanceInfo']> {
+  const url = buildBalanceUrl(provider);
+  if (!url || !provider.apiKey) return null;
 
   try {
-    // 1. Try local proxy to avoid CORS
-    response = await fetch('/api/proxy', {
+    const response = await proxyRequest(url, {
       method: 'GET',
-      headers: {
-        ...headers,
-        'x-target-url': targetUrl,
-      },
+      headers: buildAuthHeaders(provider),
+      timeoutMs: 15_000,
     });
-  } catch (err: any) {
-    fetchError = err;
-    // 2. Direct fetch fallback
-    try {
-      response = await fetch(targetUrl, {
-        method: 'GET',
-        headers,
-      });
-    } catch (directErr) {
-      fetchError = directErr;
-    }
-  }
+    if (!response.ok) return null;
 
-  const latencyMs = Math.round(performance.now() - startTime);
-
-  if (!response) {
-    if (provider.presetKey === 'ollama') {
-      return {
-        status: 'offline',
-        statusMessage: 'Offline: Local Ollama daemon not reachable at localhost:11434',
-        latencyMs,
-        models: [],
-        balanceInfo: null,
+    const payload = (await response.json()) as {
+      data?: {
+        usage?: number;
+        limit?: number | null;
+        is_free_tier?: boolean;
+        rate_limit?: { requests?: number; interval?: string };
       };
-    }
-
-    return {
-      status: 'offline',
-      statusMessage: `Connection Failed: ${fetchError?.message || 'Host unreachable'}`,
-      latencyMs,
-      models: [],
-      balanceInfo: null,
     };
-  }
+    const info = payload?.data;
+    if (!info) return null;
 
-  if (response.status === 401 || response.status === 403) {
-    return {
-      status: 'invalid_key',
-      statusMessage: `Authentication Failed (${response.status}): Key invalid or expired`,
-      latencyMs,
-      models: [],
-      balanceInfo: null,
-    };
-  }
-
-  if (response.status === 429) {
-    const retryAfter = response.headers.get('retry-after') || '60';
-    return {
-      status: 'rate_limited',
-      statusMessage: `Rate Limited (429): Quota exhausted. Backoff ${retryAfter}s.`,
-      latencyMs,
-      models: [],
-      balanceInfo: null,
-    };
-  }
-
-  if (response.status >= 500) {
-    return {
-      status: 'degraded',
-      statusMessage: `Service Outage (${response.status}): Upstream returned server error`,
-      latencyMs,
-      models: [],
-      balanceInfo: null,
-    };
-  }
-
-  // Handle successful response: parse dynamic model catalog
-  let discoveredModels: LLMModel[] = [];
-  let balanceInfo: ProviderConfig['balanceInfo'] = null;
-
-  try {
-    const rawData = await response.json();
-    const nowIso = new Date().toISOString();
-
-    if (provider.presetKey === 'ollama' && Array.isArray(rawData?.models)) {
-      discoveredModels = rawData.models.map((m: any) => ({
-        id: m.name || m.model,
-        name: m.name || m.model,
-        providerId: provider.id,
-        contextWindow: m.details?.parameter_size ? parseInt(m.details.parameter_size, 10) : undefined,
-        inputCostPer1m: 0,
-        outputCostPer1m: 0,
-        category: 'general',
-        supportsStreaming: true,
-        lastDiscoveredAt: nowIso,
-      }));
-    } else if (Array.isArray(rawData?.data)) {
-      discoveredModels = rawData.data.map((m: any) => {
-        const id = m.id || m.name;
-        return {
-          id,
-          name: m.name || id,
-          providerId: provider.id,
-          contextWindow: m.context_length || (m.max_tokens ? m.max_tokens * 2 : 32768),
-          inputCostPer1m: m.pricing?.prompt ? parseFloat(m.pricing.prompt) * 1000000 : 0.50,
-          outputCostPer1m: m.pricing?.completion ? parseFloat(m.pricing.completion) * 1000000 : 1.50,
-          category: (id.includes('reason') || id.includes('r1') || id.includes('o1') || id.includes('o3'))
-            ? 'reasoning'
-            : (id.includes('code') || id.includes('coder'))
-            ? 'coding'
-            : (id.includes('flash') || id.includes('mini') || id.includes('haiku') || id.includes('8b'))
-            ? 'fast'
-            : 'general',
-          supportsStreaming: true,
-          description: m.description || `Discovered from ${provider.name} at ${provider.baseUrl}`,
-          lastDiscoveredAt: nowIso,
-        };
-      });
-    } else if (Array.isArray(rawData?.models)) {
-      discoveredModels = rawData.models.map((m: any) => {
-        const id = m.id || m.name || String(m);
-        return {
-          id,
-          name: m.display_name || m.name || id,
-          providerId: provider.id,
-          contextWindow: m.context_window || 32768,
-          inputCostPer1m: 1.0,
-          outputCostPer1m: 3.0,
-          category: 'general',
-          supportsStreaming: true,
-          lastDiscoveredAt: nowIso,
-        };
-      });
-    }
-
-    // For OpenRouter instances, fetch live upstream balance
-    if (provider.presetKey === 'openrouter' && provider.apiKey) {
-      try {
-        const balanceRes = await fetch('/api/proxy', {
-          headers: {
-            'Authorization': `Bearer ${provider.apiKey}`,
-            'x-target-url': 'https://openrouter.ai/api/v1/auth/key',
-          },
-        });
-        if (balanceRes.ok) {
-          const bData = await balanceRes.json();
-          const info = bData?.data;
-          if (info) {
-            const usage = info.usage || 0;
-            const limit = info.limit;
-            const remaining = (limit !== null && limit !== undefined) ? Math.max(0, limit - usage) : undefined;
-            balanceInfo = {
-              creditsRemainingUsd: remaining,
-              usageTotalUsd: usage,
-              isFreeTier: info.is_free_tier ?? false,
-              rateLimitRemaining: info.rate_limit?.requests,
-              rateLimitReset: info.rate_limit?.interval,
-            };
-          }
-        }
-      } catch (bErr) {
-        console.warn('Could not fetch OpenRouter balance:', bErr);
-      }
-    }
+    const usage = typeof info.usage === 'number' ? info.usage : 0;
+    const limit = info.limit;
+    const remaining = typeof limit === 'number' ? Math.max(0, limit - usage) : undefined;
 
     return {
-      status: 'active',
-      statusMessage: `Active (Valid) · ${discoveredModels.length} models discovered`,
-      latencyMs,
-      models: discoveredModels,
-      balanceInfo,
+      creditsRemainingUsd: remaining,
+      usageTotalUsd: usage,
+      isFreeTier: info.is_free_tier ?? false,
+      rateLimitRemaining: info.rate_limit?.requests,
+      rateLimitReset: info.rate_limit?.interval,
     };
   } catch {
-    return {
-      status: 'active',
-      statusMessage: 'Active (Valid) · Verified connection',
-      latencyMs,
-      models: [],
-      balanceInfo: null,
-    };
+    // Balance is a nicety; never let it fail discovery.
+    return null;
   }
 }
 
 /**
- * Dispatch test completion prompt to provider
+ * Validate a provider and pull its model catalog.
+ *
+ * Never throws: transport and timeout problems are classified into a
+ * `ProviderStatus` so the UI always has something to show.
  */
-export async function dispatchTestCompletion(
-  provider: ProviderConfig,
-  modelId: string,
-  prompt: string
-): Promise<{
+export async function validateAndDiscover(provider: ProviderConfig): Promise<DiscoveryResult> {
+  const started = performance.now();
+  const elapsed = () => Math.round(performance.now() - started);
+
+  if (!provider.apiKey && provider.authType !== 'none') {
+    return failure('unconfigured', 'Unconfigured (no API key)', 0);
+  }
+
+  const url = buildModelsUrl(provider);
+  const headers = withAnthropicVersion(buildAuthHeaders(provider), provider);
+
+  let response: Response;
+  try {
+    response = await proxyRequest(url, { method: 'GET', headers, timeoutMs: DEFAULT_TIMEOUT_MS });
+  } catch (err) {
+    const latencyMs = elapsed();
+    if (err instanceof ProxyError) {
+      if (err.kind === 'timeout') {
+        return failure(
+          'offline',
+          `Timed out after ${Math.round(DEFAULT_TIMEOUT_MS / 1000)}s reaching ${provider.baseUrl}`,
+          latencyMs
+        );
+      }
+      if (err.kind === 'unauthorized') return failure('invalid_key', err.message, latencyMs);
+      return failure('offline', err.message, latencyMs);
+    }
+    return failure(
+      'offline',
+      `Connection failed: ${(err as Error)?.message ?? 'unknown error'}`,
+      latencyMs
+    );
+  }
+
+  const latencyMs = elapsed();
+
+  if (response.status === 401 || response.status === 403) {
+    return failure(
+      'invalid_key',
+      `Authentication failed (${response.status}): key rejected or expired`,
+      latencyMs
+    );
+  }
+  if (response.status === 429) {
+    const retryAfter = response.headers.get('retry-after') || '60';
+    return failure('rate_limited', `Rate limited (429). Retry after ${retryAfter}s.`, latencyMs);
+  }
+  if (response.status === 404) {
+    return failure(
+      'degraded',
+      `Model list not found (404) at ${url}. Check the discovery path for this endpoint.`,
+      latencyMs
+    );
+  }
+  if (response.status >= 500) {
+    return failure('degraded', `Upstream error (${response.status})`, latencyMs);
+  }
+  if (!response.ok) {
+    return failure('degraded', `Unexpected response (${response.status})`, latencyMs);
+  }
+
+  let models: LLMModel[];
+  try {
+    models = parseModelsPayload(provider, await response.json());
+  } catch {
+    // Reachable but not JSON: report degraded rather than claiming success.
+    return {
+      status: 'degraded',
+      statusMessage: 'Reachable, but the model list was not valid JSON',
+      latencyMs,
+      models: [],
+      balanceInfo: null,
+    };
+  }
+
+  const balanceInfo = await fetchOpenRouterBalance(provider);
+
+  return {
+    status: 'active',
+    statusMessage:
+      models.length > 0
+        ? `Active · ${models.length} model${models.length === 1 ? '' : 's'} discovered`
+        : 'Active · endpoint reachable, no models listed',
+    latencyMs,
+    models,
+    balanceInfo,
+  };
+}
+
+/* ----------------------------------------------------------------- dispatch */
+
+export type CompletionStatus =
+  | 'success'
+  | 'rate_limited'
+  | 'auth_error'
+  | 'network_error'
+  | 'server_error'
+  | 'timeout'
+  | 'cancelled';
+
+export interface CompletionResult {
   text: string;
   promptTokens: number;
   completionTokens: number;
   totalTokens: number;
   latencyMs: number;
-  status: 'success' | 'rate_limited' | 'auth_error' | 'network_error' | 'server_error';
-  rawPayload: any;
+  status: CompletionStatus;
+  rawPayload: unknown;
   error?: string;
-}> {
-  const startTime = performance.now();
+  /** True when token counts were estimated locally instead of reported. */
+  tokensEstimated: boolean;
+}
 
-  let endpoint = provider.baseUrl.replace(/\/+$/, '');
-  let body: any;
-  const headers: Record<string, string> = {
-    'Content-Type': 'application/json',
-  };
+export interface DispatchOptions {
+  maxTokens?: number;
+  temperature?: number;
+  signal?: AbortSignal;
+  timeoutMs?: number;
+}
 
-  if (provider.authType === 'bearer') {
-    headers['Authorization'] = `Bearer ${provider.apiKey}`;
-  } else if (provider.authType === 'x-api-key') {
-    headers['x-api-key'] = provider.apiKey;
-    headers['anthropic-version'] = '2023-06-01';
-  } else if (provider.authType === 'custom' && provider.customHeaderName) {
-    headers[provider.customHeaderName] = provider.apiKey;
-  }
+/** Rough fallback only, used when a provider omits its usage block. */
+function estimateTokens(text: string): number {
+  return text.length === 0 ? 0 : Math.max(1, Math.round(text.length / 4));
+}
 
-  if (provider.presetKey === 'anthropic' || provider.id.startsWith('anthropic')) {
-    endpoint += '/messages';
-    body = {
-      model: modelId,
-      max_tokens: 400,
-      messages: [{ role: 'user', content: prompt }],
-    };
-  } else if (provider.presetKey === 'ollama' || provider.id.startsWith('ollama')) {
-    endpoint += '/api/generate';
-    body = {
-      model: modelId,
-      prompt,
-      stream: false,
-    };
-  } else {
-    // OpenAI-compatible chat completion endpoint
-    if (!endpoint.endsWith('/chat/completions')) {
-      if (endpoint.endsWith('/v1')) {
-        endpoint += '/chat/completions';
-      } else {
-        endpoint += '/v1/chat/completions';
-      }
-    }
-    body = {
-      model: modelId,
-      messages: [{ role: 'user', content: prompt }],
-      max_tokens: 400,
-    };
-  }
+function buildCompletionRequest(
+  provider: ProviderConfig,
+  modelId: string,
+  prompt: string,
+  options: DispatchOptions
+): { url: string; headers: Record<string, string>; body: Record<string, unknown> } {
+  const headers = withAnthropicVersion(buildAuthHeaders(provider), provider);
+  const url = buildChatUrl(provider);
+  const maxTokens = options.maxTokens ?? 400;
+  const temperature = options.temperature;
 
-  try {
-    const response = await fetch('/api/proxy', {
-      method: 'POST',
-      headers: {
-        ...headers,
-        'x-target-url': endpoint,
-      },
-      body: JSON.stringify(body),
-    });
-
-    const latencyMs = Math.round(performance.now() - startTime);
-
-    if (response.status === 401 || response.status === 403) {
-      return {
-        text: '',
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-        latencyMs,
-        status: 'auth_error',
-        rawPayload: { status: response.status },
-        error: `Authentication failed (${response.status}) - verify API key.`,
-      };
-    }
-
-    if (response.status === 429) {
-      return {
-        text: '',
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-        latencyMs,
-        status: 'rate_limited',
-        rawPayload: { status: 429 },
-        error: 'Rate limit or quota exceeded (429). Please back off requests.',
-      };
-    }
-
-    if (!response.ok) {
-      const errText = await response.text();
-      return {
-        text: '',
-        promptTokens: 0,
-        completionTokens: 0,
-        totalTokens: 0,
-        latencyMs,
-        status: 'server_error',
-        rawPayload: errText,
-        error: `Provider HTTP Error ${response.status}: ${errText.slice(0, 200)}`,
-      };
-    }
-
-    const data = await response.json();
-    let text = '';
-    let promptTokens = Math.max(1, Math.round(prompt.length / 4));
-    let completionTokens = 0;
-
-    if (provider.presetKey === 'anthropic' || provider.id.startsWith('anthropic')) {
-      text = data?.content?.[0]?.text || '';
-      promptTokens = data?.usage?.input_tokens || promptTokens;
-      completionTokens = data?.usage?.output_tokens || Math.round(text.length / 4);
-    } else if (provider.presetKey === 'ollama' || provider.id.startsWith('ollama')) {
-      text = data?.response || '';
-      promptTokens = data?.prompt_eval_count || promptTokens;
-      completionTokens = data?.eval_count || Math.round(text.length / 4);
-    } else {
-      text = data?.choices?.[0]?.message?.content || '';
-      promptTokens = data?.usage?.prompt_tokens || promptTokens;
-      completionTokens = data?.usage?.completion_tokens || Math.round(text.length / 4);
-    }
-
+  if (provider.presetKey === 'anthropic') {
     return {
-      text,
-      promptTokens,
-      completionTokens,
-      totalTokens: promptTokens + completionTokens,
-      latencyMs,
-      status: 'success',
-      rawPayload: data,
+      url,
+      headers,
+      body: {
+        model: modelId,
+        max_tokens: maxTokens,
+        messages: [{ role: 'user', content: prompt }],
+        ...(temperature !== undefined ? { temperature } : {}),
+      },
     };
-  } catch (netErr: any) {
-    const latencyMs = Math.round(performance.now() - startTime);
+  }
+
+  if (provider.presetKey === 'ollama') {
+    return {
+      url,
+      headers,
+      body: {
+        model: modelId,
+        prompt,
+        stream: false,
+        options: { num_predict: maxTokens, ...(temperature !== undefined ? { temperature } : {}) },
+      },
+    };
+  }
+
+  return {
+    url,
+    headers,
+    body: {
+      model: modelId,
+      messages: [{ role: 'user', content: prompt }],
+      max_tokens: maxTokens,
+      ...(temperature !== undefined ? { temperature } : {}),
+    },
+  };
+}
+
+function extractCompletion(
+  provider: ProviderConfig,
+  data: Record<string, unknown>
+): { text: string; promptTokens?: number; completionTokens?: number } {
+  if (provider.presetKey === 'anthropic') {
+    const content = data.content as Array<{ text?: string }> | undefined;
+    const usage = data.usage as { input_tokens?: number; output_tokens?: number } | undefined;
+    return {
+      text: content?.map(part => part.text ?? '').join('') ?? '',
+      promptTokens: usage?.input_tokens,
+      completionTokens: usage?.output_tokens,
+    };
+  }
+
+  if (provider.presetKey === 'ollama') {
+    return {
+      text: (data.response as string) ?? '',
+      promptTokens: data.prompt_eval_count as number | undefined,
+      completionTokens: data.eval_count as number | undefined,
+    };
+  }
+
+  const choices = data.choices as
+    | Array<{ message?: { content?: string }; text?: string }>
+    | undefined;
+  const usage = data.usage as
+    | { prompt_tokens?: number; completion_tokens?: number }
+    | undefined;
+
+  return {
+    text: choices?.[0]?.message?.content ?? choices?.[0]?.text ?? '',
+    promptTokens: usage?.prompt_tokens,
+    completionTokens: usage?.completion_tokens,
+  };
+}
+
+/**
+ * Send one completion. Never throws — every failure mode maps to a
+ * `CompletionStatus`, and the caller always gets a `latencyMs`.
+ */
+export async function dispatchTestCompletion(
+  provider: ProviderConfig,
+  modelId: string,
+  prompt: string,
+  options: DispatchOptions = {}
+): Promise<CompletionResult> {
+  const started = performance.now();
+  const elapsed = () => Math.round(performance.now() - started);
+  const timeoutMs = options.timeoutMs ?? COMPLETION_TIMEOUT_MS;
+
+  const { url, headers, body } = buildCompletionRequest(provider, modelId, prompt, options);
+
+  let response: Response;
+  try {
+    response = await proxyRequest(url, {
+      method: 'POST',
+      headers,
+      body,
+      timeoutMs,
+      signal: options.signal,
+    });
+  } catch (err) {
+    const latencyMs = elapsed();
+    const base = {
+      text: '',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      latencyMs,
+      rawPayload: { error: (err as Error)?.message },
+      tokensEstimated: false,
+    };
+
+    if (err instanceof ProxyError) {
+      if (err.kind === 'timeout') return { ...base, status: 'timeout', error: err.message };
+      if (err.kind === 'unauthorized') return { ...base, status: 'auth_error', error: err.message };
+      return { ...base, status: 'network_error', error: err.message };
+    }
+    return {
+      ...base,
+      status: 'network_error',
+      error: (err as Error)?.message ?? 'Unknown error',
+    };
+  }
+
+  const latencyMs = elapsed();
+
+  if (response.status === 401 || response.status === 403) {
     return {
       text: '',
       promptTokens: 0,
       completionTokens: 0,
       totalTokens: 0,
       latencyMs,
-      status: 'network_error',
-      rawPayload: { error: netErr?.message },
-      error: `Network request failed: ${netErr?.message || 'Connection refused'}`,
+      status: 'auth_error',
+      rawPayload: { status: response.status },
+      error: `Authentication failed (${response.status}). Check the API key for this endpoint.`,
+      tokensEstimated: false,
     };
   }
+
+  if (response.status === 429) {
+    const retryAfter = response.headers.get('retry-after');
+    return {
+      text: '',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      latencyMs,
+      status: 'rate_limited',
+      rawPayload: { status: 429, retryAfter },
+      error: `Rate limit or quota exceeded (429)${retryAfter ? `. Retry after ${retryAfter}s.` : '.'}`,
+      tokensEstimated: false,
+    };
+  }
+
+  if (!response.ok) {
+    let detail = '';
+    try {
+      detail = (await response.text()).slice(0, 300);
+    } catch {
+      detail = '';
+    }
+    return {
+      text: '',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      latencyMs,
+      status: 'server_error',
+      rawPayload: detail,
+      error: `Provider error ${response.status}${detail ? `: ${detail}` : ''}`,
+      tokensEstimated: false,
+    };
+  }
+
+  let data: Record<string, unknown>;
+  try {
+    data = (await response.json()) as Record<string, unknown>;
+  } catch {
+    return {
+      text: '',
+      promptTokens: 0,
+      completionTokens: 0,
+      totalTokens: 0,
+      latencyMs,
+      status: 'server_error',
+      rawPayload: null,
+      error: 'Provider returned a non-JSON body.',
+      tokensEstimated: false,
+    };
+  }
+
+  const extracted = extractCompletion(provider, data);
+  const tokensEstimated =
+    extracted.promptTokens === undefined || extracted.completionTokens === undefined;
+
+  const promptTokens = extracted.promptTokens ?? estimateTokens(prompt);
+  const completionTokens = extracted.completionTokens ?? estimateTokens(extracted.text);
+
+  return {
+    text: extracted.text,
+    promptTokens,
+    completionTokens,
+    totalTokens: promptTokens + completionTokens,
+    latencyMs,
+    status: 'success',
+    rawPayload: data,
+    tokensEstimated,
+  };
 }

@@ -1,6 +1,6 @@
 import React, { useState, useMemo } from 'react';
 import { LedgerEntry, ProviderConfig } from '../types';
-import { exportLedgerCsv } from '../services/ledger';
+import { exportLedgerCsv, summarizeLedger } from '../services/ledger';
 
 interface TokenLedgerPanelProps {
   entries: LedgerEntry[];
@@ -29,29 +29,9 @@ export const TokenLedgerPanel: React.FC<TokenLedgerPanelProps> = ({
     });
   }, [entries, filterProvider, searchQuery]);
 
-  // Summary Metrics (100% dynamic, computed solely from actual entries)
-  const metrics = useMemo(() => {
-    let totalTokens = 0;
-    let totalCost = 0;
-    let totalLatency = 0;
-    let successCount = 0;
-
-    entries.forEach(e => {
-      totalTokens += e.totalTokens;
-      totalCost += e.costUsd;
-      totalLatency += e.latencyMs;
-      if (e.status === 'success') successCount++;
-    });
-
-    const avgLatency = entries.length > 0 ? Math.round(totalLatency / entries.length) : 0;
-    return {
-      totalTokens,
-      totalCost,
-      avgLatency,
-      totalEntries: entries.length,
-      successRate: entries.length > 0 ? Math.round((successCount / entries.length) * 100) : 100,
-    };
-  }, [entries]);
+  // Summary metrics come from the shared helper so the panel and any export
+  // agree, and so "estimated" cost is tracked separately from measured cost.
+  const metrics = useMemo(() => summarizeLedger(entries), [entries]);
 
   // Live upstream balances where exposed
   const providersWithBalance = useMemo(() => {
@@ -140,10 +120,16 @@ export const TokenLedgerPanel: React.FC<TokenLedgerPanelProps> = ({
             TOTAL SESSION SPEND
           </div>
           <div className="mt-2 text-2xl font-light text-white tabular-nums">
-            ${metrics.totalCost.toFixed(5)}
+            ${metrics.totalCostUsd.toFixed(5)}
           </div>
           <div className="mt-1 text-xs text-zinc-500">
-            Across {metrics.totalEntries} live requests
+            Across {metrics.count} live requests
+            {metrics.estimatedCostUsd > 0 && (
+              <span className="block text-amber-500/80">
+                ${metrics.estimatedCostUsd.toFixed(5)} estimated · $
+                {metrics.measuredCostUsd.toFixed(5)} published
+              </span>
+            )}
           </div>
         </div>
 
@@ -164,7 +150,7 @@ export const TokenLedgerPanel: React.FC<TokenLedgerPanelProps> = ({
             AVERAGE LATENCY
           </div>
           <div className="mt-2 text-2xl font-light text-white tabular-nums">
-            {metrics.avgLatency} <span className="text-sm text-zinc-400">ms</span>
+            {metrics.averageLatencyMs} <span className="text-sm text-zinc-400">ms</span>
           </div>
           <div className="mt-1 text-xs text-zinc-500">
             Round-trip response time
@@ -269,6 +255,12 @@ export const TokenLedgerPanel: React.FC<TokenLedgerPanelProps> = ({
                       </td>
                       <td className="py-3 px-4 text-right tabular-nums text-zinc-200 font-medium">
                         ${entry.costUsd.toFixed(5)}
+                        {entry.priceSource === 'estimate' && (
+                          <span className="block text-[10px] text-amber-500/80">estimate</span>
+                        )}
+                        {entry.priceSource === 'local' && (
+                          <span className="block text-[10px] text-zinc-500">local</span>
+                        )}
                       </td>
                       <td className="py-3 px-4 text-right tabular-nums text-zinc-400">
                         {entry.latencyMs} ms
@@ -278,10 +270,16 @@ export const TokenLedgerPanel: React.FC<TokenLedgerPanelProps> = ({
                           className={`px-2 py-0.5 rounded text-[10px] border ${
                             entry.status === 'success'
                               ? 'bg-zinc-900 border-zinc-700 text-white font-medium'
-                              : 'bg-rose-950/40 border-rose-800 text-rose-300'
+                              : entry.status === 'rate_limited' || entry.status === 'timeout'
+                                ? 'bg-amber-950/40 border-amber-800 text-amber-300'
+                                : entry.status === 'cancelled'
+                                  ? 'bg-zinc-900 border-zinc-700 text-zinc-400'
+                                  : 'bg-rose-950/40 border-rose-800 text-rose-300'
                           }`}
                         >
-                          {entry.status === 'success' ? '200 OK' : entry.status.toUpperCase()}
+                          {entry.status === 'success'
+                            ? '200 OK'
+                            : entry.status.replace('_', ' ').toUpperCase()}
                         </span>
                       </td>
                     </tr>

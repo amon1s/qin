@@ -1,9 +1,9 @@
 /**
  * @license
- * SPDX-License-Identifier: Apache-2.0
+ * SPDX-License-Identifier: MIT
  */
 
-import { useState, useEffect, useCallback } from 'react';
+import { useCallback, useEffect, useMemo, useRef, useState } from 'react';
 import GhostFibers from './components/GhostFibers';
 import SplashView from './components/SplashView';
 import TopBar, { ActiveTab } from './components/TopBar';
@@ -14,25 +14,37 @@ import DispatcherPlayground from './components/DispatcherPlayground';
 import SettingsPanel from './components/SettingsPanel';
 import StatusLoggerModal from './components/StatusLoggerModal';
 import {
-  ProviderConfig,
-  ProviderId,
-  ProviderStatus,
-  KeyringState,
-  LedgerEntry,
   AppLogEntry,
   AppSettings,
   AuthType,
+  KeyringState,
+  LedgerEntry,
+  LLMModel,
+  ProviderConfig,
+  ProviderId,
+  ProviderStatus,
 } from './types';
 import { CANONICAL_PROVIDERS, validateAndDiscover } from './services/providers';
-import { getLedgerEntries, addLedgerRecord, clearLedger } from './services/ledger';
+import { addLedgerRecord, clearLedger, getLedgerEntries } from './services/ledger';
 import {
-  encryptData,
-  decryptData,
-  saveVaultToDisk,
-  loadVaultFromDisk,
+  EncryptedPayload,
+  KDF_VERSION,
+  PBKDF2_ITERATIONS,
+  VaultMeta,
   clearVaultFromDisk,
-  hashString,
+  createVault,
+  generateEmergencyRecoveryKey,
+  loadVaultFromDisk,
+  migrateLegacyVault,
+  needsUpgrade,
+  rekeyWithPassword,
+  saveVaultToDisk,
+  setRecoveryKey as wrapRecoveryKey,
+  unlockVault,
+  unlockVaultWithRecovery,
+  updateVaultBody,
 } from './services/crypto';
+import { bridge, initStorage, readKey, storageLocation, writeKey } from './services/storage';
 
 const DEFAULT_SETTINGS: AppSettings = {
   theme: 'dark',
@@ -47,64 +59,187 @@ const DEFAULT_SETTINGS: AppSettings = {
   fiberThreads: 72,
   fiberLayers: 3,
   autoValidateOnStartup: true,
-  archRiceTelemetry: true,
 };
 
+/** Shape of a provider as persisted inside the encrypted vault. */
+interface StoredProvider {
+  id: ProviderId;
+  name: string;
+  companyName: string;
+  instanceName: string;
+  baseUrl: string;
+  modelsEndpoint: string;
+  chatEndpoint?: string;
+  authType: AuthType;
+  customHeaderName?: string;
+  apiKey: string;
+  isCustom?: boolean;
+  presetKey?: string;
+  models?: LLMModel[];
+}
+
+interface VaultBody {
+  version: number;
+  providers: StoredProvider[];
+}
+
+const APP_VERSION = bridge()?.config?.version ?? '1.1.0';
+
+/** Coalesce vault writes: editing a key fires many updates in quick succession. */
+const SAVE_DEBOUNCE_MS = 600;
+
+function emptyProvider(seed: (typeof CANONICAL_PROVIDERS)[number]): ProviderConfig {
+  return {
+    ...seed,
+    apiKey: '',
+    status: seed.authType === 'none' ? 'active' : 'unconfigured',
+    models: [],
+    balanceInfo: null,
+  };
+}
+
+function statusFor(provider: Pick<ProviderConfig, 'apiKey' | 'authType'>): ProviderStatus {
+  if (provider.apiKey) return 'active';
+  return provider.authType === 'none' ? 'active' : 'unconfigured';
+}
+
+function toStoredProvider(provider: ProviderConfig): StoredProvider {
+  return {
+    id: provider.id,
+    name: provider.name,
+    companyName: provider.companyName,
+    instanceName: provider.instanceName,
+    baseUrl: provider.baseUrl,
+    modelsEndpoint: provider.modelsEndpoint,
+    chatEndpoint: provider.chatEndpoint,
+    authType: provider.authType,
+    customHeaderName: provider.customHeaderName,
+    apiKey: provider.apiKey,
+    isCustom: provider.isCustom,
+    presetKey: provider.presetKey,
+    // Persisted so discovered pricing and context windows survive a reload
+    // instead of being discarded on every unlock.
+    models: provider.models,
+  };
+}
+
+/** Parse a decrypted vault body, tolerating the legacy `{ id: key }` dictionary. */
+function parseVaultBody(plaintext: string): {
+  providers: StoredProvider[] | null;
+  legacyKeys: Record<string, string> | null;
+} {
+  let parsed: unknown;
+  try {
+    parsed = JSON.parse(plaintext);
+  } catch {
+    return { providers: null, legacyKeys: null };
+  }
+  if (!parsed || typeof parsed !== 'object') return { providers: null, legacyKeys: null };
+
+  const record = parsed as Record<string, unknown>;
+  if (Array.isArray(record.providers)) {
+    return { providers: record.providers as StoredProvider[], legacyKeys: null };
+  }
+
+  const entries = Object.entries(record).filter(
+    ([, value]) => typeof value === 'string' && value.length > 0
+  );
+  if (entries.length > 0) {
+    return {
+      providers: null,
+      legacyKeys: Object.fromEntries(entries) as Record<string, string>,
+    };
+  }
+
+  return { providers: [], legacyKeys: null };
+}
+
+function hydrateProviders(
+  stored: StoredProvider[] | null,
+  legacyKeys: Record<string, string> | null
+): ProviderConfig[] {
+  if (stored && stored.length > 0) {
+    return stored.map(item => {
+      const seed = CANONICAL_PROVIDERS.find(candidate => candidate.id === item.id);
+      const merged = {
+        ...(seed ? emptyProvider(seed) : ({} as ProviderConfig)),
+        ...item,
+        modelsEndpoint: item.modelsEndpoint || '/models',
+        models: Array.isArray(item.models) ? item.models : [],
+        balanceInfo: null,
+      } as ProviderConfig;
+      merged.status = statusFor(merged);
+      merged.statusMessage = merged.apiKey ? undefined : 'Unconfigured';
+      return merged;
+    });
+  }
+
+  const base = CANONICAL_PROVIDERS.map(emptyProvider);
+
+  if (legacyKeys) {
+    return base.map(provider => {
+      const key = legacyKeys[provider.id] ?? '';
+      if (!key) return provider;
+      return { ...provider, apiKey: key, status: statusFor({ ...provider, apiKey: key }) };
+    });
+  }
+
+  return base;
+}
+
 export default function App() {
-  // Splash and Lockscreen state
+  const [booting, setBooting] = useState(true);
   const [showSplash, setShowSplash] = useState(true);
-
-  // Active workspace tab
   const [activeTab, setActiveTab] = useState<ActiveTab>('vault');
+  const [testDispatcherTarget, setTestDispatcherTarget] = useState<{
+    providerId: ProviderId;
+    modelId: string;
+  } | null>(null);
 
-  // Selected model for quick test dispatching
-  const [testDispatcherTarget, setTestDispatcherTarget] = useState<{ providerId: ProviderId; modelId: string } | null>(null);
-
-  // App Settings
-  const [settings, setSettings] = useState<AppSettings>(() => {
-    try {
-      const stored = localStorage.getItem('qin_app_settings');
-      return stored ? { ...DEFAULT_SETTINGS, ...JSON.parse(stored) } : DEFAULT_SETTINGS;
-    } catch {
-      return DEFAULT_SETTINGS;
-    }
-  });
-
-  // Providers state (100% dynamic models initialized empty)
-  const [providers, setProviders] = useState<ProviderConfig[]>(() => {
-    return CANONICAL_PROVIDERS.map(p => ({
-      ...p,
-      apiKey: '',
-      status: p.authType === 'none' ? 'active' : 'unconfigured',
-      models: [],
-      balanceInfo: null,
-    }));
-  });
-
-  // Keyring security state
+  const [settings, setSettings] = useState<AppSettings>(DEFAULT_SETTINGS);
+  const [providers, setProviders] = useState<ProviderConfig[]>(() =>
+    CANONICAL_PROVIDERS.map(emptyProvider)
+  );
   const [keyring, setKeyring] = useState<KeyringState>({
     isLocked: true,
     hasInitializedVault: false,
   });
-
-  // Active session passphrase in volatile memory (erased when locked)
   const [sessionPassphrase, setSessionPassphrase] = useState<string | null>(null);
-
-  // Ledger state
   const [ledgerEntries, setLedgerEntries] = useState<LedgerEntry[]>([]);
-
-  // Logs state
   const [logs, setLogs] = useState<AppLogEntry[]>([]);
   const [isLogsModalOpen, setIsLogsModalOpen] = useState(false);
 
-  // Validation / probe states
-  const [isTestingProvider, setIsTestingProvider] = useState<ProviderId | null>(null);
+  // Validation state is a set: two providers can be in flight at once, and the
+  // old single-id flag let whichever finished first clear the other's spinner.
+  const [inFlight, setInFlight] = useState<Set<ProviderId>>(() => new Set());
   const [isValidatingAll, setIsValidatingAll] = useState(false);
   const [isRefreshingDiscovery, setIsRefreshingDiscovery] = useState(false);
 
-  // Append structured log
+  // Refs that always hold the freshest values, so async loops and debounced
+  // writers never read a stale closure.
+  const providersRef = useRef<ProviderConfig[]>(providers);
+  const passphraseRef = useRef<string | null>(null);
+  const dataKeyRef = useRef<Uint8Array | null>(null);
+  const saveTimerRef = useRef<number | null>(null);
+  const savingRef = useRef(false);
+  const bootedRef = useRef(false);
+
+  useEffect(() => {
+    providersRef.current = providers;
+  }, [providers]);
+
+  useEffect(() => {
+    passphraseRef.current = sessionPassphrase;
+  }, [sessionPassphrase]);
+
   const logEvent = useCallback(
-    (level: AppLogEntry['level'], title: string, message: string, providerId?: ProviderId, actionRequired?: string) => {
+    (
+      level: AppLogEntry['level'],
+      title: string,
+      message: string,
+      providerId?: ProviderId,
+      actionRequired?: string
+    ) => {
       const entry: AppLogEntry = {
         id: 'log_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
         timestamp: new Date().toISOString(),
@@ -119,526 +254,708 @@ export default function App() {
     []
   );
 
-  // Theme, Glassmorphism Blur, and Font Scale Engine Sync
+  /* ------------------------------------------------------------- boot / load */
+
   useEffect(() => {
-    const root = document.documentElement;
+    let cancelled = false;
 
-    // Glassmorphism Blur Attribute: immediately updates CSS variable --glass-blur
-    root.setAttribute('data-blur', settings.blurIntensity);
+    void (async () => {
+      await initStorage();
+      if (cancelled) return;
 
-    // Font Scale
-    const scaleMap = {
-      small: '0.9',
-      medium: '1.0',
-      large: '1.15',
+      const storedSettings = readKey<Partial<AppSettings>>('settings');
+      if (storedSettings) setSettings({ ...DEFAULT_SETTINGS, ...storedSettings });
+
+      setLedgerEntries(getLedgerEntries());
+
+      const { payload, meta } = loadVaultFromDisk();
+      if (payload) {
+        setKeyring({ isLocked: true, hasInitializedVault: true, salt: meta?.salt });
+        logEvent(
+          'info',
+          'Keystore located',
+          `Encrypted vault mounted from ${storageLocation()}.`
+        );
+      } else {
+        setKeyring({ isLocked: false, hasInitializedVault: false });
+      }
+
+      bootedRef.current = true;
+      setBooting(false);
+    })();
+
+    return () => {
+      cancelled = true;
     };
-    root.style.setProperty('--app-scale', scaleMap[settings.fontScale] || '1.0');
+  }, [logEvent]);
 
-    localStorage.setItem('qin_app_settings', JSON.stringify(settings));
+  // Theme / blur / font scale, persisted alongside everything else.
+  useEffect(() => {
+    if (!bootedRef.current) return;
+    const root = document.documentElement;
+    root.setAttribute('data-blur', settings.blurIntensity);
+    const scaleMap = { small: '0.9', medium: '1.0', large: '1.15' } as const;
+    root.style.setProperty('--app-scale', scaleMap[settings.fontScale] ?? '1.0');
+    writeKey('settings', settings);
   }, [settings]);
 
-  // Load Vault Metadata on Initial Mount
-  useEffect(() => {
-    const { payload, meta } = loadVaultFromDisk();
-    const ledger = getLedgerEntries();
-    setLedgerEntries(ledger);
+  /* ------------------------------------------------------------ vault writes */
 
-    if (payload && meta && meta.hasInitialized) {
-      setKeyring({
-        isLocked: true,
-        hasInitializedVault: true,
-        masterPasswordHash: meta.masterPasswordHash,
-        recoveryKeyHash: meta.recoveryKeyHash,
-        salt: meta.salt,
+  const persistSnapshot = useCallback(async () => {
+    const passphrase = passphraseRef.current;
+    const rawDataKey = dataKeyRef.current;
+    if (!passphrase || !rawDataKey || savingRef.current) return;
+
+    savingRef.current = true;
+    try {
+      const { payload, meta } = loadVaultFromDisk();
+      if (!payload) return;
+
+      const body: VaultBody = {
+        version: KDF_VERSION,
+        providers: providersRef.current.map(toStoredProvider),
+      };
+
+      const next = await updateVaultBody(payload, rawDataKey, JSON.stringify(body));
+      saveVaultToDisk(next, {
+        hasInitialized: true,
+        createdAt: meta?.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        kdfIterations: PBKDF2_ITERATIONS,
+        recoveryNeedsSetup: meta?.recoveryNeedsSetup ?? !next.recovery,
       });
-      logEvent('info', 'Keystore Located', 'Encrypted AES-GCM vault payload mounted from disk.');
-    } else {
-      setKeyring({
-        isLocked: false,
-        hasInitializedVault: false,
-      });
+    } catch (err) {
+      console.error('[qin] failed to persist vault:', err);
+      logEvent('error', 'Vault write failed', String((err as Error)?.message ?? err));
+    } finally {
+      savingRef.current = false;
     }
   }, [logEvent]);
 
-  // Persist Vault Encrypted Helper (saving full instance configurations + keys)
-  const saveVaultSnapshot = async (currentProviders: ProviderConfig[], passphrase: string) => {
-    try {
-      const vaultData = {
-        providers: currentProviders.map(p => ({
-          id: p.id,
-          name: p.name,
-          companyName: p.companyName,
-          instanceName: p.instanceName,
-          baseUrl: p.baseUrl,
-          modelsEndpoint: p.modelsEndpoint,
-          authType: p.authType,
-          customHeaderName: p.customHeaderName,
-          apiKey: p.apiKey,
-          isCustom: p.isCustom,
-          presetKey: p.presetKey,
-        })),
-      };
+  const scheduleSave = useCallback(() => {
+    if (!passphraseRef.current || !dataKeyRef.current) return;
+    if (saveTimerRef.current) window.clearTimeout(saveTimerRef.current);
+    saveTimerRef.current = window.setTimeout(() => {
+      saveTimerRef.current = null;
+      void persistSnapshot();
+    }, SAVE_DEBOUNCE_MS);
+  }, [persistSnapshot]);
 
-      const encrypted = await encryptData(JSON.stringify(vaultData), passphrase);
-      const masterPasswordHash = await hashString(passphrase);
-      const { meta } = loadVaultFromDisk();
-
-      saveVaultToDisk(encrypted, {
-        hasInitialized: true,
-        salt: encrypted.salt,
-        masterPasswordHash,
-        recoveryKeyHash: meta?.recoveryKeyHash || '',
-        createdAt: meta?.createdAt || new Date().toISOString(),
-      });
-    } catch (e) {
-      console.error('Failed to encrypt vault:', e);
+  const flushSave = useCallback(async () => {
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
     }
-  };
+    await persistSnapshot();
+  }, [persistSnapshot]);
 
-  // First-Time Vault Initialization
-  const handleInitializeVault = async (masterPassword: string, recoveryKey: string): Promise<boolean> => {
-    try {
-      const masterPasswordHash = await hashString(masterPassword);
-      const recoveryKeyHash = await hashString(recoveryKey);
-      const encrypted = await encryptData(JSON.stringify({ providers: [] }), masterPassword);
-
-      saveVaultToDisk(encrypted, {
-        hasInitialized: true,
-        salt: encrypted.salt,
-        masterPasswordHash,
-        recoveryKeyHash,
-        createdAt: new Date().toISOString(),
+  /** The single place that mutates providers: keeps the ref and the save in sync. */
+  const applyProviders = useCallback(
+    (updater: (prev: ProviderConfig[]) => ProviderConfig[]) => {
+      setProviders(prev => {
+        const next = updater(prev);
+        providersRef.current = next;
+        return next;
       });
+      scheduleSave();
+    },
+    [scheduleSave]
+  );
 
-      setSessionPassphrase(masterPassword);
-      setKeyring({
-        isLocked: false,
-        hasInitializedVault: true,
-        masterPasswordHash,
-        recoveryKeyHash,
-        salt: encrypted.salt,
-        lastUnlocked: new Date().toISOString(),
-      });
+  /* ------------------------------------------------------- vault lifecycle */
 
-      logEvent('info', 'Vault Initialized', 'Master password and 12-char recovery key established.');
-      return true;
-    } catch {
-      return false;
-    }
-  };
+  const handleInitializeVault = useCallback(
+    async (masterPassword: string, recoveryKey: string): Promise<boolean> => {
+      try {
+        const body: VaultBody = {
+          version: KDF_VERSION,
+          providers: providersRef.current.map(toStoredProvider),
+        };
+        const payload = await createVault(JSON.stringify(body), masterPassword, recoveryKey);
 
-  // Unlock Vault with Master Password
-  const handleUnlockVault = async (masterPassword: string): Promise<boolean> => {
-    const { payload, meta } = loadVaultFromDisk();
-    if (!payload || !meta) {
-      setKeyring(prev => ({ ...prev, isLocked: false }));
-      return true;
-    }
+        saveVaultToDisk(payload, {
+          hasInitialized: true,
+          createdAt: new Date().toISOString(),
+          updatedAt: new Date().toISOString(),
+          kdfIterations: PBKDF2_ITERATIONS,
+          recoveryNeedsSetup: false,
+        });
 
-    try {
-      const inputHash = await hashString(masterPassword);
-      if (meta.masterPasswordHash && meta.masterPasswordHash !== inputHash) {
+        // Keep the data key so later edits don't pay the KDF again.
+        const unlocked = await unlockVault(payload, masterPassword);
+        dataKeyRef.current = unlocked?.rawDataKey ?? null;
+        setSessionPassphrase(masterPassword);
+        setKeyring({
+          isLocked: false,
+          hasInitializedVault: true,
+          salt: payload.salt,
+          lastUnlocked: new Date().toISOString(),
+        });
+
+        logEvent(
+          'info',
+          'Vault initialized',
+          'Data key wrapped twice: once for the master password, once for the recovery key.'
+        );
+        return true;
+      } catch (err) {
+        logEvent('error', 'Vault init failed', String((err as Error)?.message ?? err));
         return false;
       }
+    },
+    [logEvent]
+  );
 
-      const decryptedJson = await decryptData(payload, masterPassword);
-      const parsedVault = JSON.parse(decryptedJson);
-
-      if (parsedVault && Array.isArray(parsedVault.providers) && parsedVault.providers.length > 0) {
-        // Restore multi-instance and custom endpoints
-        setProviders(parsedVault.providers.map((p: any) => ({
-          ...p,
-          status: (p.apiKey || p.authType === 'none' ? 'active' : 'unconfigured') as ProviderStatus,
-          models: [],
-          balanceInfo: null,
-        })));
-      } else if (parsedVault && typeof parsedVault === 'object') {
-        // Backward-compatible key dictionary format
-        setProviders(prev =>
-          prev.map(p => ({
-            ...p,
-            apiKey: parsedVault[p.id] || p.apiKey,
-            status: (parsedVault[p.id] || p.authType === 'none' ? 'active' : 'unconfigured') as ProviderStatus,
-          }))
-        );
+  const handleUnlockVault = useCallback(
+    async (masterPassword: string): Promise<boolean> => {
+      const { payload, meta } = loadVaultFromDisk();
+      if (!payload) {
+        setKeyring(prev => ({ ...prev, isLocked: false }));
+        return true;
       }
 
+      const unlocked = await unlockVault(payload, masterPassword);
+      if (!unlocked) return false;
+
+      const { providers: stored, legacyKeys } = parseVaultBody(unlocked.plaintext);
+      const hydrated = hydrateProviders(stored, legacyKeys);
+      providersRef.current = hydrated;
+      setProviders(hydrated);
+      dataKeyRef.current = unlocked.rawDataKey;
       setSessionPassphrase(masterPassword);
       setKeyring(prev => ({
         ...prev,
         isLocked: false,
         lastUnlocked: new Date().toISOString(),
       }));
+      logEvent('info', 'Keystore unlocked', 'Decrypted the AES-GCM vault successfully.');
 
-      logEvent('info', 'Keystore Unlocked', 'Decrypted AES-GCM keyring successfully.');
+      // Legacy payload or weak KDF: migrate to the wrapped-data-key format now
+      // that we hold the plaintext. The old recovery key cannot be carried over
+      // (we never held it), so flag the vault as needing a new one.
+      if (needsUpgrade(payload) || !unlocked.rawDataKey) {
+        try {
+          const migrated = await migrateLegacyVault(unlocked.plaintext, masterPassword);
+          const recoveryNeedsSetup = !migrated.recovery;
+          saveVaultToDisk(migrated, {
+            hasInitialized: true,
+            createdAt: meta?.createdAt ?? new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            kdfIterations: PBKDF2_ITERATIONS,
+            recoveryNeedsSetup,
+          });
+          const reUnlocked = await unlockVault(migrated, masterPassword);
+          dataKeyRef.current = reUnlocked?.rawDataKey ?? null;
+          logEvent(
+            'info',
+            'Vault upgraded',
+            `Re-encrypted at ${PBKDF2_ITERATIONS.toLocaleString()} PBKDF2 iterations with a wrapped data key.`
+          );
+          if (recoveryNeedsSetup) {
+            logEvent(
+              'warn',
+              'Recovery key needs renewal',
+              'This vault predates the wrapped-key format, so its old recovery key cannot unseal it. Set a new recovery key from the vault panel.',
+              undefined,
+              'Open Key Vault → [Set Recovery Key]'
+            );
+          }
+        } catch (err) {
+          logEvent('error', 'Vault upgrade failed', String((err as Error)?.message ?? err));
+        }
+      }
 
-      // Auto-validate providers on unlock
       if (settings.autoValidateOnStartup) {
-        setTimeout(() => handleValidateAll(), 400);
+        window.setTimeout(() => void validateAllRef.current(), 500);
       }
 
       return true;
-    } catch {
-      return false;
-    }
-  };
+    },
+    [logEvent, settings.autoValidateOnStartup]
+  );
 
-  // Recover Vault with Emergency Recovery Key
-  const handleRecoverVault = async (recoveryKey: string, newPassword: string): Promise<boolean> => {
-    const { payload, meta } = loadVaultFromDisk();
-    if (!payload || !meta) return false;
+  const handleRecoverVault = useCallback(
+    async (recoveryKey: string, newPassword: string): Promise<boolean> => {
+      const { payload, meta } = loadVaultFromDisk();
+      if (!payload) return false;
 
-    try {
-      const inputRecoveryHash = await hashString(recoveryKey);
-      if (meta.recoveryKeyHash !== inputRecoveryHash) {
+      // Refuse rather than destroy. A vault with no recovery wrap cannot be
+      // opened by a recovery key; the old build "recovered" by re-encrypting an
+      // empty provider list, which silently wiped every stored key.
+      if (!payload.recovery) {
+        logEvent(
+          'error',
+          'Recovery unavailable',
+          'This vault has no recovery key bound to it. Use [Reset Keystore] if the master password is lost.',
+          undefined,
+          'Set a recovery key while unlocked to prevent this'
+        );
         return false;
       }
 
-      let vaultContent = { providers };
-      try {
-        if (sessionPassphrase) {
-          const decrypted = await decryptData(payload, sessionPassphrase);
-          vaultContent = JSON.parse(decrypted);
-        }
-      } catch {
-        // Fallback
-      }
+      const unlocked = await unlockVaultWithRecovery(payload, recoveryKey);
+      if (!unlocked || !unlocked.rawDataKey) return false;
 
-      const newPasswordHash = await hashString(newPassword);
-      const encrypted = await encryptData(JSON.stringify(vaultContent), newPassword);
-
-      saveVaultToDisk(encrypted, {
+      const rekeyed = await rekeyWithPassword(payload, unlocked.rawDataKey, newPassword);
+      saveVaultToDisk(rekeyed, {
         hasInitialized: true,
-        salt: encrypted.salt,
-        masterPasswordHash: newPasswordHash,
-        recoveryKeyHash: meta.recoveryKeyHash,
-        createdAt: meta.createdAt,
+        createdAt: meta?.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        kdfIterations: PBKDF2_ITERATIONS,
+        recoveryNeedsSetup: false,
       });
 
+      const { providers: stored, legacyKeys } = parseVaultBody(unlocked.plaintext);
+      const hydrated = hydrateProviders(stored, legacyKeys);
+      providersRef.current = hydrated;
+      setProviders(hydrated);
+      dataKeyRef.current = unlocked.rawDataKey;
       setSessionPassphrase(newPassword);
       setKeyring(prev => ({
         ...prev,
         isLocked: false,
-        masterPasswordHash: newPasswordHash,
+        hasInitializedVault: true,
         lastUnlocked: new Date().toISOString(),
       }));
 
-      logEvent('warn', 'Vault Recovered', 'Reset master password using 12-char emergency recovery key.');
+      logEvent(
+        'warn',
+        'Vault recovered',
+        'Master password reset with the recovery key. Stored keys were preserved.'
+      );
       return true;
-    } catch {
-      return false;
-    }
-  };
+    },
+    [logEvent]
+  );
 
-  // Lock Vault: Seals session and redirects to startup screen
-  const handleLockVault = () => {
-    setSessionPassphrase(null);
-    setKeyring(prev => ({ ...prev, isLocked: true }));
-    setProviders(prev =>
-      prev.map(p => ({
-        ...p,
-        apiKey: '', // Erase from volatile memory
-      }))
-    );
-    setShowSplash(true); // Redirect to startup screen
-    logEvent('info', 'Keystore Sealed', 'Volatile memory purged. Session locked.');
-  };
+  const handleSetRecoveryKey = useCallback(
+    async (masterPassword: string): Promise<{ ok: boolean; recoveryKey?: string }> => {
+      const { payload, meta } = loadVaultFromDisk();
+      if (!payload) return { ok: false };
 
-  // Password verification guard (for copy/reveal actions)
-  const handleVerifyMasterPassword = async (password: string): Promise<boolean> => {
-    const { meta } = loadVaultFromDisk();
-    if (!meta || !meta.masterPasswordHash) {
-      return password === sessionPassphrase;
-    }
-    const inputHash = await hashString(password);
-    return inputHash === meta.masterPasswordHash;
-  };
+      const unlocked = await unlockVault(payload, masterPassword);
+      if (!unlocked || !unlocked.rawDataKey) return { ok: false };
 
-  // Update a provider key (auto-triggers discovery re-fetch + resets OpenRouter balance if empty)
-  const handleUpdateProviderKey = async (id: ProviderId, newKey: string) => {
-    let updatedConfig: ProviderConfig | null = null;
-
-    setProviders(prev => {
-      const updated: ProviderConfig[] = prev.map(p => {
-        if (p.id === id) {
-          const cfg: ProviderConfig = {
-            ...p,
-            apiKey: newKey,
-            status: (newKey ? 'active' : 'unconfigured') as ProviderStatus,
-            balanceInfo: newKey ? p.balanceInfo : null,
-            models: newKey ? p.models : [],
-            latencyMs: newKey ? p.latencyMs : undefined,
-            statusMessage: newKey ? undefined : 'Unconfigured',
-          };
-          updatedConfig = cfg;
-          return cfg;
-        }
-        return p;
+      const recoveryKey = generateEmergencyRecoveryKey();
+      const wrapped = await wrapRecoveryKey(payload, unlocked.rawDataKey, recoveryKey);
+      saveVaultToDisk(wrapped, {
+        hasInitialized: true,
+        createdAt: meta?.createdAt ?? new Date().toISOString(),
+        updatedAt: new Date().toISOString(),
+        kdfIterations: PBKDF2_ITERATIONS,
+        recoveryNeedsSetup: false,
       });
 
-      if (sessionPassphrase) {
-        saveVaultSnapshot(updated, sessionPassphrase);
-      }
+      logEvent('info', 'Recovery key set', 'A new recovery key is now bound to this vault.');
+      return { ok: true, recoveryKey };
+    },
+    [logEvent]
+  );
 
-      return updated;
-    });
-
-    logEvent('info', 'API Key Stored', `Updated credential payload for ${id}.`, id);
-
-    if (newKey && updatedConfig) {
-      handleValidateProvider(id);
+  const handleLockVault = useCallback(() => {
+    if (saveTimerRef.current) {
+      window.clearTimeout(saveTimerRef.current);
+      saveTimerRef.current = null;
     }
-  };
+    void persistSnapshot();
 
-  // Add Endpoint Instance (Section II.2: Presets, Custom OpenAI-Compatible, Custom Unpreseted, Multi-instance)
-  const handleAddEndpointInstance = (cfg: {
-    companyName: string;
-    instanceName: string;
-    baseUrl: string;
-    modelsEndpoint: string;
-    authType: AuthType;
-    customHeaderName?: string;
-    apiKey: string;
-    presetKey?: string;
-    isCustom?: boolean;
-  }) => {
-    const newId = `${cfg.presetKey || 'inst'}_${Date.now().toString(36)}`;
-    const formattedName = `${cfg.companyName} ${cfg.instanceName}`.trim();
-
-    const newInstance: ProviderConfig = {
-      id: newId,
-      name: formattedName,
-      companyName: cfg.companyName,
-      instanceName: cfg.instanceName,
-      baseUrl: cfg.baseUrl,
-      modelsEndpoint: cfg.modelsEndpoint || '/models',
-      authType: cfg.authType,
-      customHeaderName: cfg.customHeaderName,
-      apiKey: cfg.apiKey,
-      presetKey: cfg.presetKey,
-      isCustom: cfg.isCustom,
-      status: cfg.apiKey || cfg.authType === 'none' ? 'active' : 'unconfigured',
-      models: [],
-      balanceInfo: null,
-    };
-
-    setProviders(prev => {
-      const updated = [...prev, newInstance];
-      if (sessionPassphrase) {
-        saveVaultSnapshot(updated, sessionPassphrase);
-      }
-      return updated;
-    });
-
-    logEvent('info', 'Endpoint Added', `Registered instance ${formattedName}`, newId);
-
-    if (cfg.apiKey || cfg.authType === 'none') {
-      setTimeout(() => handleValidateProvider(newId), 300);
-    }
-  };
-
-  // Remove Endpoint Instance
-  const handleRemoveEndpointInstance = (id: ProviderId) => {
-    setProviders(prev => {
-      const updated = prev.filter(p => p.id !== id);
-      if (sessionPassphrase) {
-        saveVaultSnapshot(updated, sessionPassphrase);
-      }
-      return updated;
-    });
-    logEvent('info', 'Endpoint Removed', `Deleted endpoint instance ${id}`);
-  };
-
-  // Validate single provider and discover models dynamically
-  const handleValidateProvider = async (id: ProviderId) => {
-    const provider = providers.find(p => p.id === id);
-    if (!provider) return;
-
-    setIsTestingProvider(id);
-    try {
-      const res = await validateAndDiscover(provider);
-
-      setProviders(prev =>
-        prev.map(p =>
-          p.id === id
-            ? {
-                ...p,
-                status: res.status,
-                statusMessage: res.statusMessage,
-                latencyMs: res.latencyMs,
-                models: res.models,
-                balanceInfo: res.balanceInfo !== undefined ? res.balanceInfo : (p.apiKey ? p.balanceInfo : null),
-                lastChecked: new Date().toISOString(),
-              }
-            : p
-        )
-      );
-
-      if (res.status === 'invalid_key') {
-        logEvent('auth', 'Auth Failure (401/403)', `${provider.name} rejected credentials.`, id, 'Re-enter valid API key in vault.');
-      } else if (res.status === 'rate_limited') {
-        logEvent('rate_limit', 'Rate Limited (429)', `${provider.name} rate limit reached.`, id, 'Back off requests or top up credits.');
-      } else if (res.status === 'offline') {
-        logEvent('error', 'Connection Offline', `Cannot reach ${provider.baseUrl}.`, id, 'Verify network or daemon status.');
-      } else if (res.status === 'active') {
-        logEvent('info', 'Validation Succeeded', `${provider.name} verified in ${res.latencyMs}ms. Discovered ${res.models.length} models.`, id);
-      }
-    } catch (err: any) {
-      logEvent('error', 'Validation Fault', `Error validating ${provider.name}: ${err?.message}`, id);
-    } finally {
-      setIsTestingProvider(null);
-    }
-  };
-
-  // Validate all providers and fetch models
-  const handleValidateAll = async () => {
-    setIsValidatingAll(true);
-    for (const p of providers) {
-      if (p.apiKey || p.authType === 'none') {
-        await handleValidateProvider(p.id);
-      }
-    }
-    setIsValidatingAll(false);
-  };
-
-  // Re-discover models manual trigger
-  const handleRefreshDiscovery = async () => {
-    setIsRefreshingDiscovery(true);
-    await handleValidateAll();
-    setIsRefreshingDiscovery(false);
-  };
-
-  // Export vault
-  const handleExportVault = () => {
-    const { payload } = loadVaultFromDisk();
-    const dataToExport = payload || {
-      v: 2,
-      providers: providers.map(p => ({
-        id: p.id,
-        name: p.name,
-        companyName: p.companyName,
-        instanceName: p.instanceName,
-        baseUrl: p.baseUrl,
-        modelsEndpoint: p.modelsEndpoint,
-        authType: p.authType,
-        customHeaderName: p.customHeaderName,
-        apiKey: p.apiKey,
-        isCustom: p.isCustom,
-        presetKey: p.presetKey,
-      })),
-    };
-
-    const blob = new Blob([JSON.stringify(dataToExport, null, 2)], { type: 'application/json' });
-    const url = URL.createObjectURL(blob);
-    const a = document.createElement('a');
-    a.href = url;
-    a.download = `qin-keyring-${Date.now()}.enc.json`;
-    document.body.appendChild(a);
-    a.click();
-    document.body.removeChild(a);
-    logEvent('info', 'Vault Exported', 'Downloaded encrypted keyring backup file.');
-  };
-
-  // Import vault
-  const handleImportVault = async (jsonString: string): Promise<boolean> => {
-    try {
-      const parsed = JSON.parse(jsonString);
-      if (parsed.ciphertext && parsed.iv && parsed.salt) {
-        saveVaultToDisk(parsed, {
-          hasInitialized: true,
-          salt: parsed.salt,
-          masterPasswordHash: '',
-          recoveryKeyHash: '',
-          createdAt: new Date().toISOString(),
-        });
-        setKeyring(prev => ({ ...prev, isLocked: true, hasInitializedVault: true }));
-        logEvent('info', 'Vault Imported', 'Loaded encrypted vault payload into local storage.');
-        return true;
-      } else if (Array.isArray(parsed.providers)) {
-        setProviders(parsed.providers.map((p: any) => ({
-          ...p,
-          status: (p.apiKey || p.authType === 'none' ? 'active' : 'unconfigured') as ProviderStatus,
-          models: [],
-          balanceInfo: null,
-        })));
-        logEvent('info', 'Vault Imported', `Restored ${parsed.providers.length} endpoint instances from backup file.`);
-        return true;
-      }
-      return false;
-    } catch (e: any) {
-      logEvent('error', 'Import Failed', `Malformed JSON: ${e?.message}`);
-      return false;
-    }
-  };
-
-  // Reset vault safely
-  const handleResetVault = () => {
-    clearVaultFromDisk();
-    setProviders(prev => prev.map(p => ({ ...p, apiKey: '', status: (p.authType === 'none' ? 'active' : 'unconfigured') as ProviderStatus, models: [], balanceInfo: null })));
-    setKeyring({ isLocked: false, hasInitializedVault: false });
     setSessionPassphrase(null);
-    logEvent('warn', 'Keystore Reinitialized', 'Keystore reset to factory state.');
+    dataKeyRef.current = null;
+    setKeyring(prev => ({ ...prev, isLocked: true }));
+    const sealed = providersRef.current.map(provider => ({ ...provider, apiKey: '' }));
+    providersRef.current = sealed;
+    setProviders(sealed);
     setShowSplash(true);
-  };
+    logEvent('info', 'Keystore sealed', 'Volatile key material purged. Session locked.');
+  }, [logEvent, persistSnapshot]);
 
-  // Record a transaction in token ledger (100% dynamic)
-  const handleRecordTransaction = (entry: Omit<LedgerEntry, 'id' | 'timestamp'>) => {
-    const newRecord = addLedgerRecord(entry);
-    setLedgerEntries(prev => [newRecord, ...prev]);
+  /** Verify the master password by unwrapping the data key. */
+  const handleVerifyMasterPassword = useCallback(async (password: string): Promise<boolean> => {
+    const { payload } = loadVaultFromDisk();
+    if (!payload) return password === passphraseRef.current;
+    return (await unlockVault(payload, password)) !== null;
+  }, []);
 
-    if (entry.status !== 'success') {
-      logEvent(
-        entry.status === 'auth_error' ? 'auth' : entry.status === 'rate_limited' ? 'rate_limit' : 'error',
-        `Completion ${entry.status.toUpperCase()}`,
-        `Model ${entry.modelId} on ${entry.providerId} failed: ${entry.errorMessage || 'No detail'}`,
-        entry.providerId,
-        entry.status === 'auth_error' ? 'Verify API Key in Vault' : undefined
+  /* ------------------------------------------------------------ provider ops */
+
+  const handleUpdateProviderKey = useCallback(
+    (id: ProviderId, newKey: string) => {
+      applyProviders(prev =>
+        prev.map(provider => {
+          if (provider.id !== id) return provider;
+          return {
+            ...provider,
+            apiKey: newKey,
+            status: statusFor({ ...provider, apiKey: newKey }),
+            statusMessage: newKey ? undefined : 'Unconfigured',
+            balanceInfo: newKey ? provider.balanceInfo : null,
+            models: newKey ? provider.models : [],
+            latencyMs: newKey ? provider.latencyMs : undefined,
+          };
+        })
       );
-    }
-  };
+      logEvent('info', 'API key stored', `Updated credential for ${id}.`, id);
+    },
+    [applyProviders, logEvent]
+  );
 
-  // Select model for test dispatcher
-  const handleSelectModelForTest = (providerId: ProviderId, modelId: string) => {
+  const handleAddEndpointInstance = useCallback(
+    (cfg: {
+      companyName: string;
+      instanceName: string;
+      baseUrl: string;
+      modelsEndpoint: string;
+      chatEndpoint?: string;
+      authType: AuthType;
+      customHeaderName?: string;
+      apiKey: string;
+      presetKey?: string;
+      isCustom?: boolean;
+    }) => {
+      const newId = `${cfg.presetKey || 'inst'}_${Date.now().toString(36)}`;
+      const formattedName = `${cfg.companyName} ${cfg.instanceName}`.trim();
+
+      const newInstance: ProviderConfig = {
+        id: newId,
+        name: formattedName,
+        companyName: cfg.companyName,
+        instanceName: cfg.instanceName,
+        baseUrl: cfg.baseUrl.trim(),
+        modelsEndpoint: cfg.modelsEndpoint.trim() || '/models',
+        chatEndpoint: cfg.chatEndpoint?.trim() || undefined,
+        authType: cfg.authType,
+        customHeaderName: cfg.customHeaderName?.trim() || undefined,
+        apiKey: cfg.apiKey.trim(),
+        presetKey: cfg.presetKey,
+        isCustom: cfg.isCustom,
+        status: statusFor({ apiKey: cfg.apiKey, authType: cfg.authType }),
+        models: [],
+        balanceInfo: null,
+      };
+
+      applyProviders(prev => [...prev, newInstance]);
+      logEvent('info', 'Endpoint added', `Registered instance ${formattedName}.`, newId);
+
+      if (newInstance.apiKey || newInstance.authType === 'none') {
+        window.setTimeout(() => void validateOneRef.current(newId), 300);
+      }
+    },
+    [applyProviders, logEvent]
+  );
+
+  const handleRemoveEndpointInstance = useCallback(
+    (id: ProviderId) => {
+      applyProviders(prev => prev.filter(provider => provider.id !== id));
+      logEvent('info', 'Endpoint removed', `Deleted endpoint instance ${id}.`);
+    },
+    [applyProviders, logEvent]
+  );
+
+  /* ------------------------------------------------------------- validation */
+
+  const handleValidateProvider = useCallback(
+    async (id: ProviderId) => {
+      // Read the freshest provider, never the one captured at render.
+      const provider = providersRef.current.find(candidate => candidate.id === id);
+      if (!provider) return;
+
+      setInFlight(prev => new Set(prev).add(id));
+      try {
+        const result = await validateAndDiscover(provider);
+
+        setProviders(prev => {
+          const next = prev.map(candidate =>
+            candidate.id === id
+              ? {
+                  ...candidate,
+                  status: result.status,
+                  statusMessage: result.statusMessage,
+                  latencyMs: result.latencyMs,
+                  models: result.models,
+                  balanceInfo:
+                    result.balanceInfo !== undefined
+                      ? result.balanceInfo
+                      : candidate.apiKey
+                        ? candidate.balanceInfo
+                        : null,
+                  lastChecked: new Date().toISOString(),
+                }
+              : candidate
+          );
+          providersRef.current = next;
+          return next;
+        });
+        scheduleSave();
+
+        if (result.status === 'invalid_key') {
+          logEvent(
+            'auth',
+            'Authentication failed',
+            `${provider.name} rejected the credentials.`,
+            id,
+            'Re-enter a valid API key in the vault.'
+          );
+        } else if (result.status === 'rate_limited') {
+          logEvent(
+            'rate_limit',
+            'Rate limited',
+            `${provider.name}: ${result.statusMessage}`,
+            id,
+            'Back off requests or top up credits.'
+          );
+        } else if (result.status === 'offline') {
+          logEvent(
+            'error',
+            'Endpoint unreachable',
+            `${provider.name}: ${result.statusMessage}`,
+            id,
+            'Check the base URL, network, or local daemon.'
+          );
+        } else if (result.status === 'degraded') {
+          logEvent('warn', 'Degraded endpoint', `${provider.name}: ${result.statusMessage}`, id);
+        } else if (result.status === 'active') {
+          logEvent(
+            'info',
+            'Validation succeeded',
+            `${provider.name} verified in ${result.latencyMs}ms. ${result.models.length} models discovered.`,
+            id
+          );
+        }
+      } catch (err) {
+        logEvent(
+          'error',
+          'Validation fault',
+          `Error validating ${provider.name}: ${String((err as Error)?.message ?? err)}`,
+          id
+        );
+      } finally {
+        setInFlight(prev => {
+          const next = new Set(prev);
+          next.delete(id);
+          return next;
+        });
+      }
+    },
+    [logEvent, scheduleSave]
+  );
+
+  const handleValidateAll = useCallback(async () => {
+    setIsValidatingAll(true);
+    try {
+      // Snapshot the freshest list so endpoints added moments ago are included.
+      const targets = providersRef.current.filter(
+        provider => provider.apiKey || provider.authType === 'none'
+      );
+      for (const target of targets) {
+        await handleValidateProvider(target.id);
+      }
+    } finally {
+      setIsValidatingAll(false);
+    }
+  }, [handleValidateProvider]);
+
+  // Stable handles so timers and effects declared earlier call the latest version.
+  const validateOneRef = useRef(handleValidateProvider);
+  const validateAllRef = useRef(handleValidateAll);
+  useEffect(() => {
+    validateOneRef.current = handleValidateProvider;
+    validateAllRef.current = handleValidateAll;
+  }, [handleValidateProvider, handleValidateAll]);
+
+  const handleRefreshDiscovery = useCallback(async () => {
+    setIsRefreshingDiscovery(true);
+    try {
+      await validateAllRef.current();
+    } finally {
+      setIsRefreshingDiscovery(false);
+    }
+  }, []);
+
+  /* --------------------------------------------------------- import / export */
+
+  const handleExportVault = useCallback(() => {
+    const { payload, meta } = loadVaultFromDisk();
+    if (!payload) {
+      logEvent('warn', 'Export skipped', 'There is no vault to export yet.');
+      return;
+    }
+
+    const bundle = { format: 'qin-vault', exportedAt: new Date().toISOString(), payload, meta };
+    const blob = new Blob([JSON.stringify(bundle, null, 2)], { type: 'application/json' });
+    const url = URL.createObjectURL(blob);
+    const anchor = document.createElement('a');
+    anchor.href = url;
+    anchor.download = `qin-keyring-${Date.now()}.enc.json`;
+    document.body.appendChild(anchor);
+    anchor.click();
+    document.body.removeChild(anchor);
+    URL.revokeObjectURL(url);
+    logEvent('info', 'Vault exported', 'Encrypted keyring bundle downloaded.');
+  }, [logEvent]);
+
+  const handleImportVault = useCallback(
+    async (jsonString: string): Promise<boolean> => {
+      try {
+        const parsed = JSON.parse(jsonString) as Record<string, unknown>;
+
+        // Accept our export bundle, a bare encrypted payload, or a plaintext
+        // provider list.
+        const candidate =
+          (parsed.payload as Record<string, unknown> | undefined) ??
+          (typeof parsed.ciphertext === 'string' ? parsed : undefined);
+
+        if (candidate && typeof candidate.ciphertext === 'string') {
+          const payload = candidate as unknown as EncryptedPayload;
+          const importedMeta = (parsed.meta as VaultMeta | undefined) ?? null;
+
+          // We do not have this vault's password, so we cannot claim a password
+          // verifier or a recovery binding for it. Record the truth; the unlock
+          // path verifies by decryption.
+          saveVaultToDisk(payload, {
+            hasInitialized: true,
+            createdAt: importedMeta?.createdAt ?? new Date().toISOString(),
+            updatedAt: new Date().toISOString(),
+            kdfIterations: payload.iterations ?? PBKDF2_ITERATIONS,
+            recoveryNeedsSetup: !payload.recovery,
+          });
+
+          setKeyring(prev => ({ ...prev, isLocked: true, hasInitializedVault: true }));
+          setSessionPassphrase(null);
+          dataKeyRef.current = null;
+          logEvent(
+            'info',
+            'Vault imported',
+            'Encrypted payload loaded. Unlock it with the password it was created with.'
+          );
+          return true;
+        }
+
+        if (Array.isArray(parsed.providers)) {
+          const hydrated = hydrateProviders(parsed.providers as StoredProvider[], null);
+          providersRef.current = hydrated;
+          setProviders(hydrated);
+          scheduleSave();
+          logEvent(
+            'info',
+            'Providers imported',
+            `Restored ${hydrated.length} endpoint instances from a plaintext backup.`
+          );
+          return true;
+        }
+
+        return false;
+      } catch (err) {
+        logEvent(
+          'error',
+          'Import failed',
+          `Malformed JSON: ${String((err as Error)?.message ?? err)}`
+        );
+        return false;
+      }
+    },
+    [logEvent, scheduleSave]
+  );
+
+  const handleResetVault = useCallback(() => {
+    clearVaultFromDisk();
+    dataKeyRef.current = null;
+    setSessionPassphrase(null);
+    const reset = CANONICAL_PROVIDERS.map(emptyProvider);
+    providersRef.current = reset;
+    setProviders(reset);
+    setKeyring({ isLocked: false, hasInitializedVault: false });
+    logEvent('warn', 'Keystore reset', 'Vault cleared. Set a new master password.');
+    setShowSplash(true);
+  }, [logEvent]);
+
+  /* ----------------------------------------------------------------- ledger */
+
+  const handleRecordTransaction = useCallback(
+    (entry: Omit<LedgerEntry, 'id' | 'timestamp'>) => {
+      const record = addLedgerRecord(entry);
+      setLedgerEntries(prev => [record, ...prev]);
+
+      if (entry.status !== 'success') {
+        logEvent(
+          entry.status === 'auth_error'
+            ? 'auth'
+            : entry.status === 'rate_limited'
+              ? 'rate_limit'
+              : 'error',
+          `Completion ${entry.status.replace('_', ' ')}`,
+          `${entry.modelId} on ${entry.providerId} failed: ${entry.errorMessage ?? 'no detail'}`,
+          entry.providerId,
+          entry.status === 'auth_error' ? 'Verify the API key in the vault' : undefined
+        );
+      }
+    },
+    [logEvent]
+  );
+
+  const handleSelectModelForTest = useCallback((providerId: ProviderId, modelId: string) => {
     setTestDispatcherTarget({ providerId, modelId });
     setActiveTab('dispatcher');
-  };
+  }, []);
 
-  // Keyboard hotkeys for power users
+  /* --------------------------------------------------------------- shortcuts */
+
   useEffect(() => {
-    const handleKeyDown = (e: KeyboardEvent) => {
-      if (['INPUT', 'TEXTAREA'].includes((e.target as HTMLElement)?.tagName)) {
-        return;
-      }
+    const onKeyDown = (event: KeyboardEvent) => {
+      const tag = (event.target as HTMLElement | null)?.tagName;
+      if (tag === 'INPUT' || tag === 'TEXTAREA' || tag === 'SELECT') return;
+      if (event.metaKey || event.ctrlKey || event.altKey) return;
 
-      if (e.key === 'Escape') {
+      if (event.key === 'Escape') {
         setShowSplash(prev => !prev);
-      } else if (e.key === '1') {
+      } else if (event.key === '1') {
         setActiveTab('vault');
-      } else if (e.key === '2') {
+      } else if (event.key === '2') {
         setActiveTab('discovery');
-      } else if (e.key === '3') {
+      } else if (event.key === '3') {
         setActiveTab('ledger');
-      } else if (e.key === '4') {
+      } else if (event.key === '4') {
         setActiveTab('dispatcher');
-      } else if (e.key === '5') {
+      } else if (event.key === '5') {
         setActiveTab('settings');
-      } else if (e.key === 'l' || e.key === 'L') {
+      } else if (event.key === 'l' || event.key === 'L') {
         if (!keyring.isLocked) handleLockVault();
       }
     };
 
-    window.addEventListener('keydown', handleKeyDown);
-    return () => window.removeEventListener('keydown', handleKeyDown);
-  }, [keyring.isLocked]);
+    window.addEventListener('keydown', onKeyDown);
+    return () => window.removeEventListener('keydown', onKeyDown);
+  }, [keyring.isLocked, handleLockVault]);
 
-  const activeProviderCount = providers.filter(p => p.status === 'active').length;
-  const errorCount = logs.filter(l => l.level === 'error' || l.level === 'auth').length;
+  // Don't lose the last edit when the window closes.
+  useEffect(() => {
+    const onBeforeUnload = () => {
+      void flushSave();
+    };
+    window.addEventListener('beforeunload', onBeforeUnload);
+    return () => window.removeEventListener('beforeunload', onBeforeUnload);
+  }, [flushSave]);
+
+  const activeProviderCount = useMemo(
+    () => providers.filter(provider => provider.status === 'active').length,
+    [providers]
+  );
+  const errorCount = useMemo(
+    () => logs.filter(entry => entry.level === 'error' || entry.level === 'auth').length,
+    [logs]
+  );
+
+  if (booting) {
+    return (
+      <div className="flex min-h-screen w-full items-center justify-center font-mono text-xs text-zinc-500">
+        Mounting local keystore…
+      </div>
+    );
+  }
 
   return (
     <div className="relative min-h-screen w-full select-none overflow-x-hidden">
-      {/* Universal Background Canvas: GhostFibers */}
       <div
-        className="fixed inset-0 z-0 pointer-events-auto transition-opacity duration-1000"
+        className="pointer-events-auto fixed inset-0 z-0 transition-opacity duration-1000"
         style={{ opacity: settings.fiberOpacity }}
       >
         <GhostFibers
@@ -647,16 +964,15 @@ export default function App() {
           layers={settings.fiberLayers ?? 3}
           twist={settings.fiberTwist}
           threads={settings.fiberThreads ?? 72}
-          fiberStyle={settings.fiberStyle ?? "dots"}
+          fiberStyle={settings.fiberStyle ?? 'dots'}
           depthOfField={1}
           hoverEffect="focus"
-          mouseInteraction={true}
+          mouseInteraction
           speed={settings.fiberSpeed}
           perspective={0.8}
         />
       </div>
 
-      {/* Startup / Splash Screen & Master Password Authentication */}
       {showSplash ? (
         <SplashView
           hasInitializedVault={keyring.hasInitializedVault}
@@ -667,9 +983,7 @@ export default function App() {
           onEnterApp={() => setShowSplash(false)}
         />
       ) : (
-        /* Main Dashboard Layout */
-        <div className="relative z-10 flex flex-col min-h-screen animate-slidefadein">
-          {/* Top Bar with Megrim Emblem on top-right (no SVG icons, monochrome) */}
+        <div className="animate-slidefadein relative z-10 flex min-h-screen flex-col">
           <TopBar
             activeTab={activeTab}
             setActiveTab={setActiveTab}
@@ -681,8 +995,7 @@ export default function App() {
             onReturnToSplash={() => setShowSplash(true)}
           />
 
-          {/* Main Content Workspace Container */}
-          <main className="flex-1 w-full max-w-7xl mx-auto px-4 sm:px-6 lg:px-8 py-6">
+          <main className="mx-auto w-full max-w-7xl flex-1 px-4 py-6 sm:px-6 lg:px-8">
             {activeTab === 'vault' && (
               <KeyVaultPanel
                 providers={providers}
@@ -696,7 +1009,8 @@ export default function App() {
                 onImportVault={handleImportVault}
                 onResetVault={handleResetVault}
                 onVerifyMasterPassword={handleVerifyMasterPassword}
-                isTestingProvider={isTestingProvider}
+                onSetRecoveryKey={handleSetRecoveryKey}
+                isTestingProvider={inFlight}
                 isValidatingAll={isValidatingAll}
               />
             )}
@@ -717,7 +1031,7 @@ export default function App() {
                 onClearLedger={() => {
                   clearLedger();
                   setLedgerEntries([]);
-                  logEvent('info', 'Ledger Cleared', 'All local transaction records purged.');
+                  logEvent('info', 'Ledger cleared', 'All local transaction records purged.');
                 }}
               />
             )}
@@ -734,44 +1048,51 @@ export default function App() {
             {activeTab === 'settings' && (
               <SettingsPanel
                 settings={settings}
-                onUpdateSettings={newS => setSettings(prev => ({ ...prev, ...newS }))}
+                storageLocation={storageLocation()}
+                appVersion={APP_VERSION}
+                onUpdateSettings={next => setSettings(prev => ({ ...prev, ...next }))}
                 onResetSettings={() => setSettings(DEFAULT_SETTINGS)}
                 onTriggerSplash={() => setShowSplash(true)}
               />
             )}
           </main>
 
-          {/* Global Footer (Section I.3 and II.2: strictly minimal status on left, hotkeys in middle, amon0id/qin with https://github.com/amon0id/qin on right) */}
-          <footer className="w-full border-t border-zinc-800/80 bg-zinc-950/80 backdrop-blur-md px-6 py-2.5 text-xs font-mono text-zinc-500 flex flex-col sm:flex-row items-center justify-between gap-2">
+          <footer className="flex w-full flex-col items-center justify-between gap-2 border-t border-zinc-800/80 bg-zinc-950/80 px-6 py-2.5 font-mono text-xs text-zinc-500 backdrop-blur-md sm:flex-row">
             <div className="flex items-center gap-2">
-              <span className="text-zinc-300">Qin v1.0.0</span>
+              <span className="text-zinc-300">Qin v{APP_VERSION}</span>
               <span className="text-zinc-700">·</span>
-              <span>{keyring.isLocked ? 'Local Vault Sealed' : 'Local Vault Active'}</span>
+              <span>{keyring.isLocked ? 'Vault sealed' : 'Vault unlocked'}</span>
+              <span className="text-zinc-700">·</span>
+              <span className="max-w-[22rem] truncate" title={storageLocation()}>
+                {storageLocation()}
+              </span>
             </div>
             <div className="text-zinc-400">
-              Hotkeys: [1-5] Workspaces · [L] Lock Session · [Esc] Splash Screen
+              Hotkeys: [1-5] workspaces · [L] lock · [Esc] splash
             </div>
-            <div>
-              <a
-                href="https://github.com/amon0id/qin"
-                target="_blank"
-                rel="noreferrer"
-                className="text-zinc-300 hover:text-white transition-colors"
-              >
-                amon0id/qin
-              </a>
-            </div>
+            <a
+              href="https://github.com/amon1s/qin"
+              onClick={event => {
+                const openExternal = bridge()?.openExternal;
+                if (openExternal) {
+                  event.preventDefault();
+                  void openExternal('https://github.com/amon1s/qin');
+                }
+              }}
+              className="text-zinc-300 transition-colors hover:text-white"
+            >
+              amon1s/qin
+            </a>
           </footer>
 
-          {/* Centralized Error Handler & Diagnostics Modal */}
           <StatusLoggerModal
             isOpen={isLogsModalOpen}
             onClose={() => setIsLogsModalOpen(false)}
             logs={logs}
             onClearLogs={() => setLogs([])}
-            onNavigateToVault={pid => {
+            onNavigateToVault={providerId => {
               setActiveTab('vault');
-              if (pid) handleValidateProvider(pid);
+              if (providerId) void validateOneRef.current(providerId);
             }}
           />
         </div>

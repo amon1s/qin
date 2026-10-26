@@ -15,8 +15,12 @@ export interface LLMModel {
   name: string;
   providerId: ProviderId;
   contextWindow?: number;
-  inputCostPer1m?: number; // in USD
-  outputCostPer1m?: number; // in USD
+  /** Absolute parameter count parsed from e.g. Ollama's "7B". */
+  parameterCount?: number;
+  /** USD per 1M tokens. Undefined when the provider publishes no price. */
+  inputCostPer1m?: number;
+  /** USD per 1M tokens. Undefined when the provider publishes no price. */
+  outputCostPer1m?: number;
   category?: 'general' | 'reasoning' | 'fast' | 'coding' | 'vision';
   supportsStreaming?: boolean;
   description?: string;
@@ -30,6 +34,8 @@ export interface ProviderConfig {
   instanceName: string; // e.g. "ABC", "Production", "Personal", "Default"
   baseUrl: string;
   modelsEndpoint: string;
+  /** Optional explicit chat path for endpoints that break /v1 conventions. */
+  chatEndpoint?: string;
   authType: AuthType;
   customHeaderName?: string;
   apiKey: string; // Plaintext in volatile memory when unlocked
@@ -49,6 +55,18 @@ export interface ProviderConfig {
   models: LLMModel[];
 }
 
+/** Where a ledger row's cost figure came from. */
+export type PriceSource = 'provider' | 'estimate' | 'local';
+
+export type LedgerStatus =
+  | 'success'
+  | 'rate_limited'
+  | 'auth_error'
+  | 'network_error'
+  | 'server_error'
+  | 'timeout'
+  | 'cancelled';
+
 export interface LedgerEntry {
   id: string;
   timestamp: string;
@@ -58,11 +76,14 @@ export interface LedgerEntry {
   completionTokens: number;
   totalTokens: number;
   costUsd: number;
+  priceSource: PriceSource;
   latencyMs: number;
-  status: 'success' | 'rate_limited' | 'auth_error' | 'network_error' | 'server_error';
+  status: LedgerStatus;
   promptSnippet: string;
   responseSnippet?: string;
   errorMessage?: string;
+  /** True when token counts were estimated locally, not reported upstream. */
+  tokensEstimated?: boolean;
 }
 
 export interface KeyringState {
@@ -98,5 +119,4 @@ export interface AppSettings {
   fiberThreads?: number;
   fiberLayers?: number;
   autoValidateOnStartup: boolean;
-  archRiceTelemetry: boolean;
 }

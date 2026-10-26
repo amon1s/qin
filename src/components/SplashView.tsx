@@ -195,7 +195,9 @@ export const SplashView: React.FC<SplashViewProps> = ({
                     Set Master Encryption Password
                   </h2>
                   <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-                    Set a master password to seal and encrypt all your API keys locally using AES-GCM 256-bit cryptography.
+                    Qin generates a random data key and wraps it twice — once with your password, once
+                    with the recovery key below. Your password is never stored; it is proven by
+                    decrypting the vault.
                   </p>
                 </div>
 
@@ -276,7 +278,8 @@ export const SplashView: React.FC<SplashViewProps> = ({
                     Recover Keystore with 12-Char Key
                   </h2>
                   <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-                    Enter the 12-character emergency key generated during setup to reset your master password.
+                    The recovery key unwraps the same data key as your password, so your stored keys
+                    survive the reset. It only works if a recovery key is bound to this vault.
                   </p>
                 </div>
 
@@ -343,7 +346,7 @@ export const SplashView: React.FC<SplashViewProps> = ({
                     Enter Master Password
                   </h2>
                   <p className="text-xs text-zinc-400 mt-1 leading-relaxed">
-                    Unseal your encrypted AES-GCM local keystore to access API keys and trigger discovery.
+                    Unseal the local AES-GCM keystore to access your keys and run discovery.
                   </p>
                 </div>
 

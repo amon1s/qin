@@ -62,6 +62,14 @@ export const ModelDiscoveryPanel: React.FC<ModelDiscoveryPanelProps> = ({
     return `${tokens} ctx`;
   };
 
+  const formatParams = (count?: number) => {
+    if (!count) return null;
+    if (count >= 1e9) return `${(count / 1e9).toFixed(count % 1e9 === 0 ? 0 : 1)}B params`;
+    if (count >= 1e6) return `${(count / 1e6).toFixed(0)}M params`;
+    if (count >= 1e3) return `${(count / 1e3).toFixed(0)}k params`;
+    return `${count} params`;
+  };
+
   return (
     <div className="space-y-6">
       {/* Header and Controls */}
@@ -207,10 +215,19 @@ export const ModelDiscoveryPanel: React.FC<ModelDiscoveryPanelProps> = ({
                 {/* Specs and action */}
                 <div className="mt-4 pt-3 border-t border-zinc-800/60 font-mono text-xs">
                   <div className="flex items-center justify-between text-zinc-400 mb-3">
-                    <span>{formatContext(model.contextWindow)}</span>
-                    {model.inputCostPer1m !== undefined && (
+                    <span className="flex items-center gap-2">
+                      <span>{formatContext(model.contextWindow)}</span>
+                      {formatParams(model.parameterCount) && (
+                        <span className="text-zinc-500">· {formatParams(model.parameterCount)}</span>
+                      )}
+                    </span>
+                    {model.inputCostPer1m !== undefined && model.outputCostPer1m !== undefined ? (
                       <span className="text-zinc-400">
-                        ${model.inputCostPer1m.toFixed(2)} in / ${model.outputCostPer1m?.toFixed(2)} out
+                        ${model.inputCostPer1m.toFixed(2)} in / ${model.outputCostPer1m.toFixed(2)} out
+                      </span>
+                    ) : (
+                      <span className="text-zinc-600" title="This provider publishes no pricing for the model">
+                        price not published
                       </span>
                     )}
                   </div>
