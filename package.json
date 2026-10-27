@@ -1,7 +1,7 @@
 {
   "name": "qin",
   "private": true,
-  "version": "1.1.0",
+  "version": "1.2.0",
   "description": "A minimal, standalone desktop app for managing and routing LLM API endpoints.",
   "author": "amon1s",
   "license": "MIT",

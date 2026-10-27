@@ -24,7 +24,10 @@ Built with React, Vite and Electron. Linux-first, packaged as a single AppImage.
 - **Test dispatcher** — send a real completion, inspect tokens, latency and the
   raw JSON. Requests can be cancelled, and every call has a deadline.
 - **Token ledger** — records tokens, latency and cost per request, and marks each
-  cost as *published* by the provider, an *estimate*, or *local* (free).
+  cost as *published* by the provider (`pricing.prompt`/`completion` from the
+  model endpoint), an *estimate* (`ESTIMATE_INPUT_PER_1M = 1.0` / output `3.0`),
+  or *local* (free, `ollama`). Costs resolve live from provider APIs (`/v1/models`,
+  `/api/tags`) or OpenRouter `/auth/key`; never fabricated.
 - **Local proxy** — the renderer never calls a provider directly. One proxy, one
   timeout policy, one place that holds the session token.
 
@@ -159,6 +162,16 @@ qin/
 - **Costs are only as good as the provider's data.** OpenRouter publishes per-model
   pricing, so its costs are exact. Where a provider publishes none, the row is
   labelled `estimate` rather than presented as measured.
+- **Prompt templates** — save/reuse prompts with variable substitution (`{name}`,
+  `{context}`). Persisted under `~/.config/qin/` via `StorageKey 'prompt_templates'`.
+  Max 100 templates; CRUD via `addPromptTemplate`, `updatePromptTemplate`,
+  `removePromptTemplate`.
+- **Live model comparison** — `validateAndDiscover()` resolves per-model pricing
+  (`resolvePrice()` from `./ledger`) and caches it as `cachedPrices: Record<string,
+  ModelPrice>` (source: `provider` | `estimate` | `local`). Discovery deduplicates
+  identical models across instances by `(presetKey || 'custom'):${model.id}`.
+- **Dispatcher search** — filter discovered models by `id`, `name`, or `description`
+  in real time before selecting for test dispatch.
 - **Single window.** A second launch focuses the existing window instead of
   starting a competing server.
 
