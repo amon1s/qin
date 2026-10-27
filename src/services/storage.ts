@@ -11,7 +11,7 @@
  * every existing call site simple while still landing on disk.
  */
 
-export type StorageKey = 'vault' | 'vault_meta' | 'ledger' | 'settings';
+export type StorageKey = 'vault' | 'vault_meta' | 'ledger' | 'settings' | 'prompt_templates';
 
 interface QinBridge {
   config: {
@@ -41,6 +41,7 @@ const LEGACY_KEYS: Record<StorageKey, string> = {
   vault_meta: 'qin_vault_meta',
   ledger: 'qin_token_ledger_v2',
   settings: 'qin_app_settings',
+  prompt_templates: 'qin_prompt_templates_v1',
 };
 
 const ALL_KEYS = Object.keys(LEGACY_KEYS) as StorageKey[];
@@ -167,4 +168,66 @@ export function removeKey(key: StorageKey): void {
 /** Wait for queued writes to land. Used before closing/exporting. */
 export async function flushStorage(): Promise<void> {
   await Promise.all([...pending]);
+}
+
+/** Prompt template management */
+
+export interface PromptTemplate {
+  id: string;
+  name: string;
+  description?: string;
+  prompt: string;
+  createdAt: string;
+  updatedAt: string;
+  variableNames: string[]; // e.g. ['{name}', '{context}']
+}
+
+export function readPromptTemplates(): PromptTemplate[] {
+  const stored = readKey<PromptTemplate[]>('prompt_templates');
+  if (!Array.isArray(stored)) return [];
+  return stored.filter(item => item && typeof item.id === 'string');
+}
+
+export function writePromptTemplates(templates: PromptTemplate[]): void {
+  writeKey('prompt_templates', templates.slice(0, 100)); // max 100 templates
+}
+
+export function addPromptTemplate(template: Omit<PromptTemplate, 'id' | 'createdAt' | 'updatedAt'>): PromptTemplate {
+  const templates = readPromptTemplates();
+  const now = new Date().toISOString();
+  const newTemplate: PromptTemplate = {
+    id: 'tmpl_' + Date.now().toString(36) + Math.random().toString(36).slice(2, 6),
+    name: template.name,
+    description: template.description,
+    prompt: template.prompt,
+    createdAt: now,
+    updatedAt: now,
+    variableNames: template.variableNames || [],
+  };
+  writePromptTemplates([newTemplate, ...templates]);
+  return newTemplate;
+}
+
+export function updatePromptTemplate(id: string, updates: Partial<Omit<PromptTemplate, 'id' | 'createdAt'>>): boolean {
+  const templates = readPromptTemplates();
+  const index = templates.findIndex(t => t.id === id);
+  if (index === -1) return false;
+  const template = templates[index];
+  const updated = {
+    ...template,
+    ...updates,
+    updatedAt: new Date().toISOString(),
+  };
+  templates[index] = updated;
+  writePromptTemplates(templates);
+  return true;
+}
+
+export function removePromptTemplate(id: string): boolean {
+  const templates = readPromptTemplates();
+  const index = templates.findIndex(t => t.id === id);
+  if (index === -1) return false;
+  templates.splice(index, 1);
+  writePromptTemplates(templates);
+  return true;
 }

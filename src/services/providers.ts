@@ -10,6 +10,7 @@
 
 import { LLMModel, ProviderConfig, ProviderStatus, AuthType } from '../types';
 import { proxyRequest, ProxyError, DEFAULT_TIMEOUT_MS, COMPLETION_TIMEOUT_MS } from './proxy';
+import { ModelPrice, resolvePrice } from './ledger';
 
 export interface ProviderPreset {
   id: string;
@@ -340,6 +341,8 @@ export interface DiscoveryResult {
   latencyMs: number;
   models: LLMModel[];
   balanceInfo?: ProviderConfig['balanceInfo'];
+  /** Cached pricing per model for comparison purposes. */
+  cachedPrices?: Record<string, ModelPrice>;
 }
 
 function failure(status: ProviderStatus, statusMessage: string, latencyMs: number): DiscoveryResult {
@@ -469,6 +472,13 @@ export async function validateAndDiscover(provider: ProviderConfig): Promise<Dis
     };
   }
 
+  // Resolve and cache pricing for each discovered model for comparison
+  const cachedPrices: Record<string, ModelPrice> = {};
+  for (const model of models) {
+    const price = resolvePrice(provider, model.id);
+    cachedPrices[model.id] = price;
+  }
+
   const balanceInfo = await fetchOpenRouterBalance(provider);
 
   return {
@@ -480,6 +490,7 @@ export async function validateAndDiscover(provider: ProviderConfig): Promise<Dis
     latencyMs,
     models,
     balanceInfo,
+    cachedPrices,
   };
 }
 

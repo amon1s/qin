@@ -50,10 +50,22 @@ export const DispatcherPlayground: React.FC<DispatcherPlaygroundProps> = ({
   const [isLoading, setIsLoading] = useState(false);
   const [result, setResult] = useState<(CompletionResult & { costUsd: number }) | null>(null);
   const [showRawJson, setShowRawJson] = useState(false);
+  const [modelSearchQuery, setModelSearchQuery] = useState('');
   const [hasCopied, setHasCopied] = useState(false);
   const abortRef = useRef<AbortController | null>(null);
 
   const effectiveModelId = customModelOverride.trim() || selectedModelId || '';
+
+  const filteredModelsForSelect = useMemo(() => {
+    if (!selectedProvider) return [];
+    if (!modelSearchQuery.trim()) return selectedProvider.models;
+    const q = modelSearchQuery.toLowerCase();
+    return selectedProvider.models.filter(m =>
+      m.id.toLowerCase().includes(q) ||
+      (m.name && m.name.toLowerCase().includes(q)) ||
+      (m.description && m.description.toLowerCase().includes(q))
+    );
+  }, [selectedProvider, modelSearchQuery]);
 
   // Price is resolved from what the provider published for this exact model,
   // not from a hardcoded default.
@@ -185,17 +197,24 @@ export const DispatcherPlayground: React.FC<DispatcherPlaygroundProps> = ({
           <label className="mb-1.5 block text-zinc-400">[2. Model]</label>
           {selectedProvider && selectedProvider.models.length > 0 ? (
             <div className="space-y-1.5">
+              <input
+                type="text"
+                placeholder="Search models by id, name, description..."
+                value={modelSearchQuery}
+                onChange={e => setModelSearchQuery(e.target.value)}
+                className="w-full rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-1.5 text-xs text-white placeholder-zinc-600 focus:border-zinc-500 focus:outline-none"
+              />
               <select
                 value={selectedModelId}
                 onChange={event => {
                   setSelectedModelId(event.target.value);
                   setCustomModelOverride('');
                 }}
-                className="w-full cursor-pointer rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-white focus:border-zinc-500 focus:outline-none"
+                className="w-full cursor-pointer rounded-lg border border-zinc-800 bg-zinc-900 px-3 py-2 text-xs text-white focus:border-zinc-500 focus:outline-none"
               >
-                {selectedProvider.models.map(model => (
+                {filteredModelsForSelect.map(model => (
                   <option key={model.id} value={model.id}>
-                    {model.name}
+                    {model.name} {model.id ? `(${model.id})` : ''}
                   </option>
                 ))}
               </select>

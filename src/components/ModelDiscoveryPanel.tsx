@@ -18,11 +18,17 @@ export const ModelDiscoveryPanel: React.FC<ModelDiscoveryPanelProps> = ({
   const [selectedProviderFilter, setSelectedProviderFilter] = useState<string>('all');
   const [selectedCategoryFilter, setSelectedCategoryFilter] = useState<string>('all');
 
-  // Collect dynamically discovered models across all providers
+  // Collect dynamically discovered models across all providers.
+  // Deduplicate by (presetKey + model.id) so different API keys for the
+  // same provider preset don't inflate the count with identical models.
   const allDiscoveredModels = useMemo(() => {
+    const seen = new Set<string>();
     const list: LLMModel[] = [];
     providers.forEach(p => {
       p.models.forEach(m => {
+        const key = `${p.presetKey ?? 'custom'}:${m.id}`;
+        if (seen.has(key)) return; // skip duplicate model from same preset
+        seen.add(key);
         list.push({ ...m, providerId: p.id });
       });
     });
